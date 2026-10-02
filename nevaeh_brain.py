@@ -1701,15 +1701,35 @@ def speak(text, allow_barge=True):
         import wave
         with wave.open(REPLY_WAV, "rb") as w:
             sr = w.getframerate()
+            sw = w.getsampwidth()
+            nch = w.getnchannels()
             raw = w.readframes(w.getnframes())
-        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if sw == 2:
+            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+            audio = audio / 32768.0
+        elif sw == 4:
+            as_f32 = np.frombuffer(raw, dtype=np.float32)
+            if np.mean(np.abs(as_f32) <= 1.0) > 0.99:
+                audio = as_f32  # 32-bit float voice file
+            else:
+                audio = (np.frombuffer(raw, dtype=np.int32).astype(np.float32)
+                         / 2147483648.0)
+        else:
+            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) \
+                / 32768.0
+        if nch == 2:
+            audio = audio.reshape(-1, 2).mean(axis=1).astype(np.float32)
         if allow_barge and MIC is not None:
             STOP_TALKING.clear()
             if _play_with_barge_in(audio, sr):
                 print("(she stopped — you're talking, she's listening)")
         else:
-            sd.play(audio, samplerate=sr)
-            sd.wait()
+            try:
+                sd.play(audio, samplerate=sr)
+                sd.wait()
+            except Exception:
+                import winsound  # last resort: the old Windows player
+                winsound.PlaySound(REPLY_WAV, winsound.SND_FILENAME)
     except Exception as e:
         print(f"(voice glitch: {e})")
     finally:
@@ -2571,7 +2591,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 59
+BRAIN_VERSION = 60
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -2744,7 +2764,7 @@ def self_diagnose():
     return " ".join(report)
 
 
-print("Nevaeh brain v59 online — update channel live. Say 'goodbye' to stop.")
+print("Nevaeh brain v60 online — voice fixed. Say 'goodbye' to stop.")
 threading.Thread(target=update_watcher, daemon=True).start()
 print("(secure update channel on — I check for my own upgrades)")
 threading.Thread(target=start_phone_remote, daemon=True).start()
