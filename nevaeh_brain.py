@@ -728,9 +728,9 @@ def init_mic():
         return
 
     # interactive: she asks, he speaks, she measures who heard him
-    print("\n  Say 'hello Nevaeh' out loud in 3... 2... 1... NOW")
+    print("\n  Say 'hello' out loud in 3... 2... 1... NOW")
     try:
-        speak("Say hello Nevaeh out loud.", allow_barge=False)
+        speak("Say hello out loud.", allow_barge=False)
     except Exception:
         pass
     time.sleep(1.0)
@@ -2851,7 +2851,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 67
+BRAIN_VERSION = 68
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -3028,7 +3028,7 @@ def self_diagnose():
 
 
 init_mic()  # needs speak() defined above; picks the mic that hears him
-print("Nevaeh brain v67 online — rebuilt. Say 'goodbye' to stop.")
+print("Nevaeh brain v68 online — rebuilt. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
