@@ -691,13 +691,58 @@ def _mic_troubleshoot():
 
 _MIC_LIVE = True  # False when mic setup never heard him → typed-only mode
 _CALM = False  # calm mode: still screen, no proactive chatter — typing-friendly
+MIC_NAME = None  # mic identity: tracked by NAME, not index (indexes shift
+MIC_HOSTAPI = None  # when devices connect/disconnect, e.g. Bluetooth)
+
+
+def _mic_index():
+    """Resolve the chosen mic NAME to its CURRENT device index.
+    Device indexes shift whenever hardware changes (Bluetooth
+    connecting, USB unplug); the name doesn't. Returns None if the
+    mic vanished — caller should re-probe."""
+    global MIC
+    if not MIC_NAME:
+        return MIC
+    try:
+        devs = sd.query_devices()
+    except Exception:
+        return MIC
+    for i, d in enumerate(devs):
+        if d["max_input_channels"] < 1:
+            continue
+        name = (d["name"] or "").strip()
+        if name != MIC_NAME:
+            continue
+        try:
+            hapi = sd.query_hostapis(d["hostapi"])["name"]
+        except Exception:
+            hapi = ""
+        if not MIC_HOSTAPI or hapi == MIC_HOSTAPI:
+            MIC = i
+            return i
+    return None
+
+
+def _mic_identity(i):
+    """(name, host-api name) for a device index — for storing the pick."""
+    try:
+        d = sd.query_devices()[i]
+        name = (d["name"] or "").strip()
+        try:
+            hapi = sd.query_hostapis(d["hostapi"])["name"]
+        except Exception:
+            hapi = ""
+        return name, hapi
+    except Exception:
+        return "", ""
 
 
 def init_mic():
     """Pick the microphone that actually hears Michael: measures room noise
     first, asks him to keep talking, and picks the mic with the biggest
-    jump over its own baseline — no guessing, immune to speaker echo."""
-    global MIC, GAIN, NOISE_FLOOR, _MIC_LIVE
+    jump over its own baseline — no guessing, immune to speaker echo.
+    The pick is stored BY NAME so it survives device renumbering."""
+    global MIC, GAIN, NOISE_FLOOR, _MIC_LIVE, MIC_NAME, MIC_HOSTAPI
     print("\nLooking for your microphone...")
     try:
         devs = sd.query_devices()
@@ -736,8 +781,9 @@ def init_mic():
         return
 
     # interactive: baseline is the health check (room noise, measured before
-    # any prompt). He keeps talking while each candidate is measured, and
-    # the mic with the biggest jump over its own baseline wins. Immune to
+    # any prompt). He keeps talking while candidates are sampled in a
+    # round-robin (several short passes — pauses don't fool it), and the
+    # mic with the biggest jump over its own baseline wins. Immune to
     # speaker echo fooling the test and to one-shot timing misses.
     cands = sorted(usable, key=lambda i: health[i], reverse=True)[:3]
     if default_in in usable and default_in not in cands:
@@ -752,11 +798,23 @@ def init_mic():
     time.sleep(0.8)
     heard, delta = {}, {}
     for i in cands:
-        heard[i] = _mic_level(i, 2.0)
-        delta[i] = heard[i] - max(health[i], 0.0)
+        heard[i], delta[i] = 0.0, -1.0
+    for _pass in range(4):  # round-robin: 4 x 0.5s per candidate
+        for i in cands:
+            lvl = _mic_level(i, 0.5)
+            heard[i] = max(heard[i], lvl)
+            delta[i] = max(delta[i], lvl - max(health[i], 0.0))
+    for i in cands:
         print(f"    [{i}] speech {heard[i]:.6f} "
               f"(room was {health[i]:.6f}, jump {delta[i]:+.6f})")
     best = max(delta, key=lambda i: delta[i])
+    # prefer the Windows default input when it's close to the best —
+    # that's the mic Windows itself (and other apps) use
+    if (default_in in delta and default_in != best
+            and delta[default_in] > 0.005
+            and delta[default_in] >= 0.5 * delta[best]):
+        best = default_in
+        print(f"  (Windows default mic is good too — using that)")
     if delta[best] < 0.005:
         print("  I didn't hear you on any microphone.")
         MIC = default_in if default_in in usable else cands[0]
@@ -767,6 +825,7 @@ def init_mic():
               "Say 'check my sound' any time to retry the mic.)")
     else:
         MIC = best
+        MIC_NAME, MIC_HOSTAPI = _mic_identity(best)
         GAIN = min(max(0.03 / max(heard[best], 1e-6), 1.0), 50.0)
         _MIC_LIVE = True
         print(f"  Got you — using mic [{best}] "
@@ -818,7 +877,7 @@ def audio_doctor():
     """Her self-run sound check: tests speaker output with a beep, then
     measures every microphone while he talks and switches to one that
     hears him. Trigger: 'check my sound'. Reports plainly what's broken."""
-    global MIC, GAIN, _MIC_LIVE
+    global MIC, GAIN, _MIC_LIVE, MIC_NAME, MIC_HOSTAPI
     print("\n==== SOUND CHECK ====")
     # --- 1) output: play a test beep ---
     sr, secs = 22050, 1.0
@@ -878,37 +937,62 @@ def audio_doctor():
             continue
         lvl = _measure_mic(i, 1.5)
         tag = "won't open" if lvl < 0 else f"{lvl:.6f}"
-        print(f"    [{i}] {name[:45]}: {tag}")
+        try:
+            sr = int(devs[i].get("default_samplerate") or 0)
+        except Exception:
+            sr = 0
+        print(f"    [{i}] {name[:40]} @{sr}Hz: {tag}")
         if lvl >= 0:
             levels.append((lvl, i, name))
     if not levels:
         print("  No microphones would open at all.")
         return "I couldn't open any microphone on this laptop."
-    print("\n  Now KEEP TALKING — say anything until I say done...")
+    print("\n  Now KEEP TALKING — count out loud until I say done...")
     try:
         speak("Keep talking until I say done.", allow_barge=False)
     except Exception:
         pass
     time.sleep(0.5)
-    talk = []
+    # round-robin: 3 passes x 0.5s per device — brief pauses don't fool it
+    jump, best_lvl = {}, {}
+    for _pass in range(3):
+        for lvl0, i, name in levels:
+            lvl = _measure_mic(i, 0.5)
+            j = lvl - max(lvl0, 0.0)
+            if j > jump.get(i, -1):
+                jump[i] = j
+                best_lvl[i] = lvl
+        print(f"    (pass {_pass + 1}/3...)")
     for lvl0, i, name in levels:
-        lvl = _measure_mic(i, 2.0)
-        jump = lvl - max(lvl0, 0.0)
-        print(f"    [{i}] while you talked: {lvl:.6f} "
-              f"(jump {jump:+.6f})")
-        talk.append((jump, lvl, i, name))
+        print(f"    [{i}] {name[:40]}: jump {jump.get(i, 0):+.6f}")
     print("  (done — thanks)")
-    talk.sort(reverse=True)
-    best_jump, best_lvl, best_i, best_name = talk[0]
-    if best_jump > 0.005 and best_lvl > 0.005:
-        if best_i != MIC:
-            MIC = best_i
-            GAIN = min(max(0.03 / max(best_lvl, 1e-6), 1.0), 50.0)
+    ranked = sorted(jump.items(), key=lambda kv: kv[1], reverse=True)
+    best_i, best_jump = ranked[0]
+    best_name = next(n for _, i, n in levels if i == best_i)
+    # prefer the Windows default input when it's close to the best
+    try:
+        default_in = sd.default.device[0]
+    except Exception:
+        default_in = None
+    if (default_in in jump and default_in != best_i
+            and jump[default_in] > 0.005
+            and jump[default_in] >= 0.5 * best_jump):
+        best_i = default_in
+        best_jump = jump[best_i]
+        best_name = next(n for _, i, n in levels if i == best_i)
+        print("  (Windows default mic is good too — using that)")
+    if best_jump > 0.005 and best_lvl.get(best_i, 0) > 0.005:
+        was = MIC
+        MIC = best_i
+        MIC_NAME, MIC_HOSTAPI = _mic_identity(best_i)
+        GAIN = min(max(0.03 / max(best_lvl[best_i], 1e-6), 1.0), 50.0)
+        if best_i != was:
             print(f"  Switched to mic [{best_i}] ({best_name[:45]}).")
         else:
-            print(f"  Mic [{best_i}] hears you fine — keeping it.")
+            print(f"  Mic [{best_i}] confirmed — keeping it.")
         _MIC_LIVE = True
-        verdict = f"Sound check done — mic {best_i} hears you now."
+        verdict = (f"Sound check done — mic {best_i} "
+                   f"({best_name[:40]}) hears you now.")
     else:
         _MIC_LIVE = False
         print("\n  I couldn't hear you on ANY microphone.")
@@ -1429,13 +1513,17 @@ def _listen_inner(timeout_secs=20):
         print("(listening)", flush=True)
     else:
         print("\nListening... speak now. (volume meter below — talk and watch it move)")
+    mi = _mic_index()
+    if mi is None:
+        print("(mic unplugged or moved — I'll re-check it)")
+        return ""
     chunks, quiet, heard_speech = [], 0, False
     for _ in range(int(timeout_secs * 2)):  # 0.5s chunks
         if not TYPE_QUEUE.empty():
             print("\n(typed command waiting — stopping listen)")
             return ""
         chunk = sd.rec(int(SAMPLE_RATE * 0.5), samplerate=SAMPLE_RATE,
-                       channels=1, dtype="float32", device=MIC)
+                       channels=1, dtype="float32", device=mi)
         sd.wait()
         chunk = np.nan_to_num(chunk * GAIN, nan=0.0, posinf=0.0,
                                 neginf=0.0)
@@ -1505,9 +1593,12 @@ def enroll_my_voice():
         speak(f"Sample {i + 1} of 3 — say 'hello Nevaeh, this is Michael'.",
               allow_barge=False)
         print(f"(recording voice sample {i + 1}/3 — speak now)")
+        mi = _mic_index()
+        if mi is None:
+            return "My microphone moved — say 'check my sound' first."
         try:
             rec = sd.rec(int(SAMPLE_RATE * 3), samplerate=SAMPLE_RATE,
-                         channels=1, dtype="float32", device=MIC)
+                         channels=1, dtype="float32", device=mi)
             sd.wait()
             samples.append(NVOICE.to_16k(rec.flatten() * GAIN, SAMPLE_RATE))
         except Exception as e:
@@ -2057,12 +2148,13 @@ def _mic_watcher():
 def _michael_talking():
     """True if Michael is speaking right now. One quick 250ms mic peek —
     never touches the mic while she is playing audio."""
-    if MIC is None:
+    mi = _mic_index()
+    if mi is None:
         return False
     try:
         time.sleep(0.25)  # let her own speaker echo die first
         rec = sd.rec(int(SAMPLE_RATE * 0.25), samplerate=SAMPLE_RATE,
-                     channels=1, dtype="float32", device=MIC)
+                     channels=1, dtype="float32", device=mi)
         sd.wait()
         rms = float(np.sqrt(np.mean(np.nan_to_num(
             rec ** 2, nan=0.0, posinf=1e12))))
@@ -3025,7 +3117,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 71
+BRAIN_VERSION = 72
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -3121,7 +3213,7 @@ def self_diagnose():
     """She checks her own health and fixes what she can:
     re-probes mics and switches to a livelier one, verifies her face
     images, checks Ollama/models, and looks for missing files."""
-    global MIC, GAIN
+    global MIC, GAIN, MIC_NAME, MIC_HOSTAPI
     report, fixed = [], []
 
     # 1) mic — re-probe everything, switch if something better appeared
@@ -3151,6 +3243,7 @@ def self_diagnose():
                               "laptop (amber light means muted).")
             elif best != MIC:
                 MIC = best
+                MIC_NAME, MIC_HOSTAPI = _mic_identity(best)
                 GAIN = min(max(0.02 / max(best_level, 1e-6), 1.0), 400.0)
                 fixed.append(f"switched to a better mic (gain x{GAIN:.1f})")
             else:
@@ -3205,7 +3298,7 @@ init_mic()  # needs speak() defined above; picks the mic that hears him
 if not _MIC_LIVE:
     _CALM = True
     print("(calm mode on — the screen will stay still. Just type to me.)")
-print("Nevaeh brain v71 online — rebuilt. Say 'goodbye' to stop.")
+print("Nevaeh brain v72 online — rebuilt. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
