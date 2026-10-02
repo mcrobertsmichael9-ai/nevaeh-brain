@@ -1085,7 +1085,8 @@ def start_type_box():
     fullscreen by default with living blue (left) and orange (right) flames
     licking up both sides. Runs in a thread; Enter sends the typed text.
     Voice: 'full screen' / 'big face' and 'small face' / 'window face'.
-    Esc also drops back to the small window."""
+    Esc closes the face window on purpose ('face on' brings it back);
+    the watchdog must not resurrect a wanted close."""
     def _box():
         while True:
             FACE_STATE["_rebuild"] = False
@@ -1487,10 +1488,21 @@ def start_type_box():
             entry.focus_set()
 
             def _esc(event=None):
-                FACE_STATE["fullscreen"] = False
-                save_setting("face_size", "window")
+                # Escape exits her face window ON PURPOSE (not a crash):
+                # hide it and save face="off" so the watchdog leaves it
+                # shut. 'face on' (typed or spoken) brings it back.
+                face_set_visible(False)
                 FACE_STATE["_rebuild"] = True
             root.bind("<Escape>", _esc)
+
+            def _on_x(event=None):
+                # Window X button: same clean close as Escape.
+                face_set_visible(False)
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+            root.protocol("WM_DELETE_WINDOW", _on_x)
             root.mainloop()
         except Exception as e:
             print(f"(Nevaeh window closed: {e})")
@@ -3117,7 +3129,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 72
+BRAIN_VERSION = 73
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -3298,7 +3310,7 @@ init_mic()  # needs speak() defined above; picks the mic that hears him
 if not _MIC_LIVE:
     _CALM = True
     print("(calm mode on — the screen will stay still. Just type to me.)")
-print("Nevaeh brain v72 online — rebuilt. Say 'goodbye' to stop.")
+print("Nevaeh brain v73 online — rebuilt. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
