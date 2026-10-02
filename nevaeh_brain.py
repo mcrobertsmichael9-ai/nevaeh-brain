@@ -743,6 +743,13 @@ def init_mic():
     jump over its own baseline — no guessing, immune to speaker echo.
     The pick is stored BY NAME so it survives device renumbering."""
     global MIC, GAIN, NOISE_FLOOR, _MIC_LIVE, MIC_NAME, MIC_HOSTAPI
+    # fast path: the backup ears (WASAPI) already proved themselves —
+    # trust them; capture falls back to PortAudio on its own if needed.
+    if SETTINGS.get("capture") == "soundcard" and _sc_module() is not None:
+        MIC_NAME, MIC_HOSTAPI = "WASAPI default microphone", "soundcard"
+        _MIC_LIVE = True
+        print("  (using my backup ears to listen)")
+        return
     print("\nLooking for your microphone...")
     try:
         devs = sd.query_devices()
@@ -846,6 +853,89 @@ def _measure_mic(device, secs):
         return -1.0
 
 
+# --- backup ears: soundcard (WASAPI via CFFI, no PortAudio) ---
+# On some laptops PortAudio delivers pure digital zeros on every input
+# while native WASAPI apps (like Sound Recorder) hear fine. soundcard
+# talks WASAPI directly — the same path those apps use.
+_sc = None  # lazy-loaded soundcard module, or False if unavailable
+
+
+def _sc_module():
+    """Import soundcard once; None if it's not installed."""
+    global _sc
+    if _sc is None:
+        try:
+            import soundcard as sc
+            _sc = sc
+        except Exception:
+            _sc = False
+    return _sc or None
+
+
+def _sc_record(secs):
+    """Record `secs` seconds of mono float32 @SAMPLE_RATE via soundcard
+    (WASAPI). Returns a 1D numpy array, or None on any failure."""
+    sc = _sc_module()
+    if sc is None:
+        return None
+    try:
+        mic = sc.default_microphone()
+    except Exception:
+        return None
+    data = None
+    for sr in (SAMPLE_RATE, 44100, 48000):
+        try:
+            data = mic.record(numframes=int(sr * secs), samplerate=sr,
+                              channels=[0])
+            break
+        except Exception:
+            continue
+    if data is None:
+        return None
+    try:
+        arr = np.asarray(data, dtype=np.float32).reshape(-1)
+        want = int(SAMPLE_RATE * secs)
+        if len(arr) != want and len(arr) > 8:
+            # resample whatever rate worked to 16000
+            x_old = np.linspace(0.0, 1.0, len(arr))
+            x_new = np.linspace(0.0, 1.0, want)
+            arr = np.interp(x_new, x_old, arr).astype(np.float32)
+        return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    except Exception:
+        return None
+
+
+def _sc_level(secs):
+    """RMS level via soundcard. -1.0 if unavailable."""
+    arr = _sc_record(secs)
+    if arr is None or len(arr) == 0:
+        return -1.0
+    return float(np.sqrt(np.mean(arr ** 2)))
+
+
+def _grab_audio(secs):
+    """Capture `secs` seconds of mono float32 @SAMPLE_RATE from the mic,
+    via the selected backend. soundcard (WASAPI) when enabled, else
+    PortAudio. Never raises — returns zeros on failure."""
+    want = int(SAMPLE_RATE * secs)
+    if SETTINGS.get("capture", "portaudio") == "soundcard":
+        arr = _sc_record(secs)
+        if arr is not None and len(arr) > 0:
+            return arr
+        # soundcard failed — fall through to PortAudio
+    try:
+        mi = _mic_index()
+        if mi is None:
+            return np.zeros(want, dtype=np.float32)
+        rec = sd.rec(want, samplerate=SAMPLE_RATE, channels=1,
+                     dtype="float32", device=mi)
+        sd.wait()
+        return np.nan_to_num(rec.reshape(-1).astype(np.float32),
+                             nan=0.0, posinf=0.0, neginf=0.0)
+    except Exception:
+        return np.zeros(want, dtype=np.float32)
+
+
 def _ask_yes_no(question, timeout=20):
     """Ask Michael a yes/no question — he can type it or say it."""
     print(f"\n{question} (type yes or no — or say it out loud)")
@@ -923,7 +1013,36 @@ def audio_doctor():
         print("  Speaker output works.")
     else:
         print("  (no answer — moving on to the mic test)")
-    # --- 2) input: measure every mic, then have him talk ---
+    # --- 2) input: try the backup ears (WASAPI) FIRST ---
+    # On some laptops PortAudio delivers pure zeros on every input while
+    # native WASAPI apps hear fine. soundcard talks WASAPI directly.
+    print("\n  Trying my backup ears first — count out loud: 1, 2, 3...")
+    try:
+        speak("Count out loud: one, two, three.", allow_barge=False)
+    except Exception:
+        pass
+    time.sleep(0.5)
+    sc_room = _sc_level(1.0)
+    try:
+        speak("Keep counting.", allow_barge=False)
+    except Exception:
+        pass
+    sc_talk = _sc_level(1.5)
+    sc_jump = sc_talk - max(sc_room, 0.0) if sc_talk >= 0 else -1
+    print(f"    backup ears: room {sc_room:.6f}, talking {sc_talk:.6f} "
+          f"(jump {sc_jump:+.6f})")
+    if sc_jump > 0.005 and sc_talk > 0.005:
+        save_setting("capture", "soundcard")
+        SETTINGS["capture"] = "soundcard"
+        MIC_NAME, MIC_HOSTAPI = "WASAPI default microphone", "soundcard"
+        GAIN = min(max(0.03 / max(sc_talk, 1e-6), 1.0), 50.0)
+        _MIC_LIVE = True
+        print("  Got you on the backup ears — I'll listen this way now.")
+        return ("Sound check done — my backup ears hear you now. "
+                "Talk to me.")
+    if sc_talk < 0:
+        print("  (backup ears not installed yet — using the normal check)")
+    # --- 3) input: measure every mic, then have him talk ---
     print("\n  Measuring every microphone — stay quiet...")
     try:
         devs = sd.query_devices()
@@ -1043,10 +1162,7 @@ def sleep_listen():
     while True:
         if not TYPE_QUEUE.empty():
             return TYPE_QUEUE.get()
-        chunk = sd.rec(int(SAMPLE_RATE * 2.5), samplerate=SAMPLE_RATE,
-                       channels=1, dtype="float32", device=MIC)
-        sd.wait()
-        chunk = chunk * GAIN
+        chunk = _grab_audio(2.5) * GAIN
         rms = float(np.sqrt(np.mean(chunk ** 2)))
         if rms <= NOISE_FLOOR:
             continue  # silence — keep waiting, transcribe nothing
@@ -1605,13 +1721,8 @@ def enroll_my_voice():
         speak(f"Sample {i + 1} of 3 — say 'hello Nevaeh, this is Michael'.",
               allow_barge=False)
         print(f"(recording voice sample {i + 1}/3 — speak now)")
-        mi = _mic_index()
-        if mi is None:
-            return "My microphone moved — say 'check my sound' first."
         try:
-            rec = sd.rec(int(SAMPLE_RATE * 3), samplerate=SAMPLE_RATE,
-                         channels=1, dtype="float32", device=mi)
-            sd.wait()
+            rec = _grab_audio(3)
             samples.append(NVOICE.to_16k(rec.flatten() * GAIN, SAMPLE_RATE))
         except Exception as e:
             return f"Couldn't record that sample ({e}). Try again."
@@ -3129,7 +3240,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 73
+BRAIN_VERSION = 74
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -3310,7 +3421,7 @@ init_mic()  # needs speak() defined above; picks the mic that hears him
 if not _MIC_LIVE:
     _CALM = True
     print("(calm mode on — the screen will stay still. Just type to me.)")
-print("Nevaeh brain v73 online — rebuilt. Say 'goodbye' to stop.")
+print("Nevaeh brain v74 online — rebuilt. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
