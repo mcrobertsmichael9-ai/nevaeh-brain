@@ -746,7 +746,8 @@ def init_mic():
     # fast path: the backup ears (WASAPI) already proved themselves —
     # trust them; capture falls back to PortAudio on its own if needed.
     if SETTINGS.get("capture") == "soundcard" and _sc_module() is not None:
-        MIC_NAME, MIC_HOSTAPI = "WASAPI default microphone", "soundcard"
+        MIC_NAME = SETTINGS.get("capture_mic") or "WASAPI microphone"
+        MIC_HOSTAPI = "soundcard"
         _MIC_LIVE = True
         print("  (using my backup ears to listen)")
         return
@@ -872,16 +873,9 @@ def _sc_module():
     return _sc or None
 
 
-def _sc_record(secs):
-    """Record `secs` seconds of mono float32 @SAMPLE_RATE via soundcard
-    (WASAPI). Returns a 1D numpy array, or None on any failure."""
-    sc = _sc_module()
-    if sc is None:
-        return None
-    try:
-        mic = sc.default_microphone()
-    except Exception:
-        return None
+def _sc_record_mic(mic, secs):
+    """Record `secs` seconds of mono float32 @SAMPLE_RATE from one
+    soundcard mic. Returns a 1D numpy array, or None on any failure."""
     data = None
     for sr in (SAMPLE_RATE, 44100, 48000):
         try:
@@ -905,12 +899,83 @@ def _sc_record(secs):
         return None
 
 
+def _sc_record(secs):
+    """Record `secs` seconds via soundcard from the chosen mic (or the
+    Windows default). Returns a 1D numpy array, or None on any failure."""
+    sc = _sc_module()
+    if sc is None:
+        return None
+    try:
+        want_name = SETTINGS.get("capture_mic")
+        mic = None
+        if want_name:
+            for m in sc.all_microphones(include_loopback=False):
+                try:
+                    if m.name == want_name:
+                        mic = m
+                        break
+                except Exception:
+                    continue
+        if mic is None:
+            mic = sc.default_microphone()
+    except Exception:
+        return None
+    return _sc_record_mic(mic, secs)
+
+
+def _sc_mic_level(mic, secs):
+    """RMS level of one soundcard mic. -1.0 if unavailable."""
+    arr = _sc_record_mic(mic, secs)
+    if arr is None or len(arr) == 0:
+        return -1.0
+    return float(np.sqrt(np.mean(arr ** 2)))
+
+
 def _sc_level(secs):
-    """RMS level via soundcard. -1.0 if unavailable."""
+    """RMS level via soundcard default mic. -1.0 if unavailable."""
     arr = _sc_record(secs)
     if arr is None or len(arr) == 0:
         return -1.0
     return float(np.sqrt(np.mean(arr ** 2)))
+
+
+def _mic_privacy_report():
+    """Read Windows' ACTUAL mic-consent state from the registry —
+    global toggle plus any per-app entries. Reveals blocks the Settings
+    screenshot can't show (e.g. a Store Python denied individually)."""
+    out = []
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion"
+            r"\CapabilityAccessManager\ConsentStore\microphone")
+        try:
+            v, _ = winreg.QueryValueEx(key, "Value")
+            out.append(f"global mic access: {v}")
+        except Exception:
+            out.append("global mic access: (not set)")
+        i, apps = 0, 0
+        while True:
+            try:
+                sub = winreg.EnumKey(key, i)
+                i += 1
+            except OSError:
+                break
+            if "python" not in sub.lower():
+                continue
+            try:
+                sk = winreg.OpenKey(key, sub)
+                sv, _ = winreg.QueryValueEx(sk, "Value")
+                out.append(f"{sub}: {sv}")
+                apps += 1
+            except Exception:
+                pass
+        if apps == 0:
+            out.append("(no per-app Python mic entry)")
+    except Exception as e:
+        out.append(f"(couldn't read mic privacy: {e})")
+    return out
 
 
 def _grab_audio(secs):
@@ -1013,35 +1078,55 @@ def audio_doctor():
         print("  Speaker output works.")
     else:
         print("  (no answer — moving on to the mic test)")
-    # --- 2) input: try the backup ears (WASAPI) FIRST ---
+    # --- 2) input: try the backup ears (WASAPI) on EVERY mic ---
     # On some laptops PortAudio delivers pure zeros on every input while
     # native WASAPI apps hear fine. soundcard talks WASAPI directly.
-    print("\n  Trying my backup ears first — count out loud: 1, 2, 3...")
+    # NOTE: the Windows DEFAULT mic may be a Bluetooth headset — test all.
+    print(f"\n  (this app runs as: {sys.executable})")
+    print("\n  Trying my backup ears on each mic —")
+    print("  count out loud from 1 to 10, keep going till I say done...")
     try:
-        speak("Count out loud: one, two, three.", allow_barge=False)
+        speak("Count out loud from one to ten, keep going.", allow_barge=False)
     except Exception:
         pass
     time.sleep(0.5)
-    sc_room = _sc_level(1.0)
-    try:
-        speak("Keep counting.", allow_barge=False)
-    except Exception:
-        pass
-    sc_talk = _sc_level(1.5)
-    sc_jump = sc_talk - max(sc_room, 0.0) if sc_talk >= 0 else -1
-    print(f"    backup ears: room {sc_room:.6f}, talking {sc_talk:.6f} "
-          f"(jump {sc_jump:+.6f})")
-    if sc_jump > 0.005 and sc_talk > 0.005:
+    sc = _sc_module()
+    sc_results = []
+    if sc is not None:
+        try:
+            sc_mics = sc.all_microphones(include_loopback=False)
+        except Exception:
+            sc_mics = []
+        print(f"    (backup ears see {len(sc_mics)} microphones)")
+        for m in sc_mics:
+            try:
+                mname = m.name
+            except Exception:
+                mname = "?"
+            room = _sc_mic_level(m, 0.8)
+            talk = _sc_mic_level(m, 1.5)
+            if talk < 0 or room < 0:
+                print(f"    [sc] {mname[:45]}: unavailable")
+                continue
+            jump = talk - max(room, 0.0)
+            print(f"    [sc] {mname[:45]}: room {room:.6f} "
+                  f"talk {talk:.6f} (jump {jump:+.6f})")
+            sc_results.append((jump, talk, mname))
+        sc_results.sort(reverse=True, key=lambda r: r[0])
+    else:
+        print("  (backup ears not installed — using the normal check)")
+    if sc_results and sc_results[0][0] > 0.005 and sc_results[0][1] > 0.005:
+        jump, talk, mname = sc_results[0]
         save_setting("capture", "soundcard")
         SETTINGS["capture"] = "soundcard"
-        MIC_NAME, MIC_HOSTAPI = "WASAPI default microphone", "soundcard"
-        GAIN = min(max(0.03 / max(sc_talk, 1e-6), 1.0), 50.0)
+        save_setting("capture_mic", mname)
+        SETTINGS["capture_mic"] = mname
+        MIC_NAME, MIC_HOSTAPI = mname, "soundcard"
+        GAIN = min(max(0.03 / max(talk, 1e-6), 1.0), 50.0)
         _MIC_LIVE = True
-        print("  Got you on the backup ears — I'll listen this way now.")
+        print(f"  Got you on the backup ears ({mname[:45]}).")
         return ("Sound check done — my backup ears hear you now. "
                 "Talk to me.")
-    if sc_talk < 0:
-        print("  (backup ears not installed yet — using the normal check)")
     # --- 3) input: measure every mic, then have him talk ---
     print("\n  Measuring every microphone — stay quiet...")
     try:
@@ -1115,11 +1200,14 @@ def audio_doctor():
     else:
         _MIC_LIVE = False
         print("\n  I couldn't hear you on ANY microphone.")
+        print("  What Windows itself says about my mic permission:")
+        for line in _mic_privacy_report():
+            print(f"    {line}")
         print("  1. Tap the mic-mute key on the keyboard (amber = muted).")
         print("  2. Windows Settings, System, Sound, Input: pick your mic,")
         print("     and check the volume bar moves when you talk.")
-        print("  3. Settings, Privacy, Microphone must be ON, and let "
-              "desktop apps use it.")
+        print("  3. Settings, Privacy & security, Microphone: everything ON,")
+        print("     AND if Python is listed below, it must be allowed too.")
         print("  (Until then, type to me in the type box — I read "
               "everything.)")
         verdict = ("Sound check done — I can't hear any mic. "
@@ -3240,7 +3328,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 74
+BRAIN_VERSION = 75
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -3421,7 +3509,7 @@ init_mic()  # needs speak() defined above; picks the mic that hears him
 if not _MIC_LIVE:
     _CALM = True
     print("(calm mode on — the screen will stay still. Just type to me.)")
-print("Nevaeh brain v74 online — rebuilt. Say 'goodbye' to stop.")
+print("Nevaeh brain v75 online — rebuilt. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
