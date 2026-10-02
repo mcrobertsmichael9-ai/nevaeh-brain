@@ -64,7 +64,7 @@ def _kill_zombie_brains():
     me = os.getpid()
     killed = []
     try:
-        ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe' or Name='pythonw.exe'\" "
               "| ForEach-Object { \"{0}|{1}\" -f $_.ProcessId,"
               " $_.CommandLine }")
         r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
@@ -3020,7 +3020,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 69
+BRAIN_VERSION = 70
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -3197,7 +3197,7 @@ def self_diagnose():
 
 
 init_mic()  # needs speak() defined above; picks the mic that hears him
-print("Nevaeh brain v69 online — rebuilt. Say 'goodbye' to stop.")
+print("Nevaeh brain v70 online — rebuilt. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
@@ -3222,6 +3222,23 @@ if paused:
 if SETTINGS.get("type_box", "on").lower() == "on":
     start_type_box()
     print("(type box open — type a command there anytime)")
+
+
+def _console_typer():
+    """Fallback command input: type directly in this console window.
+    Feeds the same queue as the face-window type box, so it works even
+    when the face window is dead and the mic hears nothing."""
+    while True:
+        try:
+            line = input()
+        except Exception:
+            return
+        if line and line.strip():
+            TYPE_QUEUE.put(line.strip())
+
+
+threading.Thread(target=_console_typer, daemon=True).start()
+print("(you can also type commands right here in this window)")
 last_spoken = ""
 last_check = 0.0
 was_present = False
@@ -3240,10 +3257,23 @@ try:
         if time.time() - last_check > 30:
             last_check = time.time()
             try:
-                if (FACE_STATE.get("visible") and _FACE_THREAD is not None
-                        and not _FACE_THREAD.is_alive()):
-                    print("(my face window died — restarting it myself)")
-                    start_type_box()
+                _ft = _FACE_THREAD
+                if (FACE_STATE.get("visible") and _ft is not None
+                        and not _ft.is_alive()):
+                    _face_deaths = globals().get("_face_deaths", 0) + 1
+                    globals()["_face_deaths"] = _face_deaths
+                    if _face_deaths == 4:
+                        print("(my face window keeps crashing — I'll stay "
+                              "in this text window. Type to me here, it "
+                              "all works the same.)")
+                    elif _face_deaths < 4:
+                        print("(my face window died — restarting it myself)")
+                        try:
+                            start_type_box()
+                        except Exception as fe:
+                            print(f"(face restart failed: {fe})")
+                elif _ft is not None and _ft.is_alive():
+                    globals()["_face_deaths"] = 0
                 if not paused and SETTINGS.get("greet_me", "on").lower() == "on":
                     present = michael_present()
                     if present and not was_present:
