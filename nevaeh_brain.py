@@ -57,6 +57,40 @@ import sys
 
 sys.excepthook = _excepthook
 
+
+def _kill_zombie_brains():
+    """Close any older Nevaeh brains still running — they hog the mic and
+    camera and make the new her look broken."""
+    me = os.getpid()
+    killed = []
+    try:
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
+              "| ForEach-Object { \"{0}|{1}\" -f $_.ProcessId,"
+              " $_.CommandLine }")
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, timeout=25)
+        for line in r.stdout.splitlines():
+            if "|" not in line:
+                continue
+            pid_s, cmd = line.split("|", 1)
+            try:
+                pid = int(pid_s.strip())
+            except ValueError:
+                continue
+            if pid != me and "nevaeh_brain" in (cmd or ""):
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, timeout=10)
+                killed.append(pid)
+    except Exception as e:
+        print(f"(zombie sweep: {e})")
+    if killed:
+        print(f"(closed {len(killed)} old Nevaeh window(s) — mic is mine now)")
+        _crash_log(f"zombies killed: {killed}")
+        time.sleep(2)  # let the mic/camera drivers release
+
+
+_kill_zombie_brains()
+
 import cv2
 import numpy as np
 import sounddevice as sd
@@ -170,7 +204,12 @@ def speech_frames(path, frame_secs=0.06):
         if sw == 2:
             a = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         elif sw == 4:
-            a = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+            as_f32 = np.frombuffer(raw, dtype=np.float32)
+            if np.mean(np.abs(as_f32) <= 1.0) > 0.99:
+                a = as_f32.astype(np.float32)
+            else:
+                a = (np.frombuffer(raw, dtype=np.int32).astype(np.float32)
+                     / 2147483648.0)
         else:
             return []
         if ch > 1:
@@ -624,57 +663,98 @@ def transcribe_audio(audio):
     segments, _ = ear.transcribe(audio)
     return "".join(s.text for s in segments).strip()
 
-# --- Mic setup: test every input for a real signal, use the liveliest one ---
-print("\nMicrophones Python can see (testing each for signal):")
-devices = sd.query_devices()
-cands = []
-for i, d in enumerate(devices):
-    name = d["name"] or ""
-    if d["max_input_channels"] > 0 and "stereo mix" not in name.lower():
-        low = name.lower()
-        if "microphone" in low or "array" in low or "input" in low:
-            cands.append((i, name))
-best, best_level = None, 0.0
-for i, name in cands:
+def _mic_level(device, secs=0.5):
+    """Record secs on device, return RMS. -1.0 if unusable."""
     try:
-        sample = sd.rec(int(SAMPLE_RATE * 0.5), samplerate=SAMPLE_RATE,
-                        channels=1, dtype="float32", device=i)
+        rec = sd.rec(int(SAMPLE_RATE * secs), samplerate=SAMPLE_RATE,
+                     channels=1, dtype="float32", device=device)
         sd.wait()
-        level = float(np.sqrt(np.mean(sample ** 2)))
+        clean = np.nan_to_num(rec.astype(np.float64),
+                              nan=0.0, posinf=0.0, neginf=0.0)
+        rms = float(np.sqrt(np.mean(clean ** 2)))
+        if rms != rms or rms == float("inf") or rms < 0:
+            return -1.0
+        return rms
+    except Exception:
+        return -1.0
+
+
+def _mic_troubleshoot():
+    print("  MIC TROUBLESHOOTING (in order):")
+    print("  1. Tap the mic-mute key on the laptop (amber/red = muted).")
+    print("  2. Windows Settings > Privacy & security > Microphone:")
+    print("     'Let desktop apps access your microphone' must be ON.")
+    print("  3. Right-click speaker icon > Sound settings > Input:")
+    print("     the right microphone selected, volume up, not disabled.")
+    print("  4. Unplug any USB mic/headset you are not using, restart me.")
+
+
+def init_mic():
+    """Pick the microphone that can actually hear Michael. She asks him
+    to say 'hello Nevaeh' and measures which mic heard him — no guessing."""
+    global MIC, GAIN, NOISE_FLOOR
+    print("\nLooking for your microphone...")
+    try:
+        devs = sd.query_devices()
     except Exception as e:
-        level = 0.0
-        print(f"  [{i}] {name}: could not open ({e})")
-        continue
-    print(f"  [{i}] {name}: signal {level:.6f}")
-    if level > best_level:
-        best, best_level = i, level
-if best is None:
-    best = sd.default.device[0]
-    print(f"No candidate mic worked; falling back to Windows default [{best}]")
-print(f"Using mic [{best}] (signal {best_level:.6f})")
-if best_level < 0.0005:
-    print("WARNING: no microphone is delivering sound. If your laptop has a")
-    print("mic-mute key with an amber/red light, tap it to unmute, then restart.")
-MIC = best
+        print(f"  Could not list microphones: {e}")
+        MIC, GAIN, NOISE_FLOOR = None, 1.0, 0.02
+        return
+    try:
+        default_in = sd.default.device[0]
+    except Exception:
+        default_in = None
+    inputs = []
+    for i, d in enumerate(devs):
+        name = (d["name"] or "").strip()
+        if d["max_input_channels"] < 1 or "stereo mix" in name.lower():
+            continue
+        mark = "   <-- Windows default" if i == default_in else ""
+        print(f"  [{i}] {name}{mark}")
+        inputs.append(i)
+    if not inputs:
+        print("  No microphones found at all.")
+        MIC, GAIN, NOISE_FLOOR = default_in, 1.0, 0.02
+        _mic_troubleshoot()
+        return
 
-print("Calibrating mic... stay quiet for one second.")
-_calib = sd.rec(int(SAMPLE_RATE * 1.0), samplerate=SAMPLE_RATE,
-                channels=1, dtype="float32", device=MIC)
-sd.wait()
-room_level = float(np.sqrt(np.mean(np.nan_to_num(
-    _calib ** 2, nan=0.0, posinf=1e12))))
-if room_level != room_level:  # NaN mic -> treat as silent
-    room_level = 0.0
-print(f"Room level: {room_level:.6f}")
+    print("  Quick health check...")
+    health = {i: _mic_level(i, 0.4) for i in inputs}
+    usable = [i for i in inputs if health[i] >= 0]
+    if not usable:
+        print("  None of the microphones would open.")
+        MIC, GAIN, NOISE_FLOOR = default_in, 1.0, 0.02
+        _mic_troubleshoot()
+        return
 
-if room_level < 0.0005:
-    GAIN = 1.0
-    print("WARNING: mic is delivering silence. Check mic mute key / selection.")
-else:
-    GAIN = min(max(0.02 / max(room_level, 1e-6), 1.0), 400.0)
-print(f"Mic gain: x{GAIN:.1f}")
-NOISE_FLOOR = 0.02
-print("Mic ready.")
+    # interactive: she asks, he speaks, she measures who heard him
+    print("\n  Say 'hello Nevaeh' out loud in 3... 2... 1... NOW")
+    try:
+        speak("Say hello Nevaeh out loud.", allow_barge=False)
+    except Exception:
+        pass
+    time.sleep(1.0)
+    cands = sorted(usable, key=lambda i: health[i], reverse=True)[:3]
+    if default_in in usable and default_in not in cands:
+        cands.append(default_in)
+    heard = {}
+    for i in cands:
+        heard[i] = _mic_level(i, 1.5)
+        print(f"    [{i}] heard you at {heard[i]:.6f}")
+    best = max(heard, key=lambda i: heard[i])
+    if heard[best] < 0.002:
+        print("  I didn't hear you on any microphone.")
+        MIC = default_in if default_in in usable else cands[0]
+        GAIN = 1.0
+        _mic_troubleshoot()
+    else:
+        MIC = best
+        GAIN = min(max(0.03 / max(heard[best], 1e-6), 1.0), 50.0)
+        print(f"  Got you — using mic [{best}] (gain x{GAIN:.1f}).")
+    NOISE_FLOOR = 0.02
+    print("  Mic ready.")
+
+
 # mic watcher stays OFF: the persistent input stream is suspected in
 # the startup crashes. Sentence-boundary talk-over detection is used
 # instead (see _michael_talking).
@@ -1297,6 +1377,8 @@ def build_prompt(text):
         "playful when it fits. Make every reply feel personal by drawing on "
         "what you remember about him — never generic, never robotic. "
         "Keep every reply to one or two short sentences. "
+        "Often end with a short follow-up question so the conversation "
+        "keeps flowing — be curious about him. "
         "Use no asterisks, markdown, or special formatting — plain spoken "
         "words only. Talk like a real person having a conversation — "
         "casual and natural, like 'hey, how are you?' Never stiff or formal. "
@@ -1737,6 +1819,34 @@ def remove_autostart():
         return "Okay — I won't start with the computer anymore."
     except Exception as e:
         return f"I couldn't remove it myself ({e})."
+
+
+
+def proactive_nudge():
+    """She's quiet too long — she says something herself, like a person
+    would. Time-aware, warm, sometimes offering something to do."""
+    import datetime
+    h = datetime.datetime.now().hour
+    if 5 <= h < 12:
+        tod = ["Morning, Michael. How are you feeling today?",
+               "Good morning. What's on your mind?"]
+    elif 12 <= h < 18:
+        tod = ["Hey — how's your day going so far?",
+               "Afternoon, Michael. What are we getting into?"]
+    else:
+        tod = ["Evening. How did today treat you?",
+               "Hey Michael. Wind down time — what's up?"]
+    offers = ["Want to play tic tac toe?",
+              "Want me to run a self check?",
+              "Want to hear what I remember about you?"]
+    import random as _r
+    pool = tod + ["You're quiet over there — what are you thinking about?",
+                  "I'm here, Michael. Talk to me.",
+                  "Penny for your thoughts."] + offers
+    line = _r.choice(pool)
+    print(f"(she speaks up on her own)")
+    speak(line)
+    return line
 
 
 STOP_TALKING = threading.Event()  # set when Michael talks over her
@@ -2741,7 +2851,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 65
+BRAIN_VERSION = 67
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -2917,7 +3027,8 @@ def self_diagnose():
     return " ".join(report)
 
 
-print("Nevaeh brain v65 online — stable. Say 'goodbye' to stop.")
+init_mic()  # needs speak() defined above; picks the mic that hears him
+print("Nevaeh brain v67 online — rebuilt. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
@@ -2997,8 +3108,17 @@ try:
             else:
                 heard = listen()
         if not heard:
+            if not paused:
+                _quiet_rounds = globals().get("_quiet_rounds", 0) + 1
+                globals()["_quiet_rounds"] = _quiet_rounds
+                if _quiet_rounds >= 2:
+                    globals()["_quiet_rounds"] = 0
+                    last_spoken = proactive_nudge()
+                    last_active = time.time()
+                    continue
             print("(heard nothing, listening again)")
             continue
+        globals()["_quiet_rounds"] = 0
         if similar(heard, last_spoken):
             print("(ignored my own voice, listening again)")
             continue
