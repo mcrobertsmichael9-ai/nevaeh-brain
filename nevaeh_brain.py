@@ -752,6 +752,15 @@ def init_mic():
         print("  (using my backup ears to listen)")
         return
     print("\nLooking for your microphone...")
+    # Try the backup ears first: on this laptop the normal audio path
+    # delivers only zeros, while WASAPI may hear fine.
+    hit = _soundcard_probe()
+    if hit:
+        _use_soundcard_mic(*hit)
+        NOISE_FLOOR = 0.02
+        print("  Mic ready.")
+        return
+    print("\n  Backup ears heard nothing — checking the normal way...")
     try:
         devs = sd.query_devices()
     except Exception as e:
@@ -1083,48 +1092,9 @@ def audio_doctor():
     # native WASAPI apps hear fine. soundcard talks WASAPI directly.
     # NOTE: the Windows DEFAULT mic may be a Bluetooth headset — test all.
     print(f"\n  (this app runs as: {sys.executable})")
-    print("\n  Trying my backup ears on each mic —")
-    print("  count out loud from 1 to 10, keep going till I say done...")
-    try:
-        speak("Count out loud from one to ten, keep going.", allow_barge=False)
-    except Exception:
-        pass
-    time.sleep(0.5)
-    sc = _sc_module()
-    sc_results = []
-    if sc is not None:
-        try:
-            sc_mics = sc.all_microphones(include_loopback=False)
-        except Exception:
-            sc_mics = []
-        print(f"    (backup ears see {len(sc_mics)} microphones)")
-        for m in sc_mics:
-            try:
-                mname = m.name
-            except Exception:
-                mname = "?"
-            room = _sc_mic_level(m, 0.8)
-            talk = _sc_mic_level(m, 1.5)
-            if talk < 0 or room < 0:
-                print(f"    [sc] {mname[:45]}: unavailable")
-                continue
-            jump = talk - max(room, 0.0)
-            print(f"    [sc] {mname[:45]}: room {room:.6f} "
-                  f"talk {talk:.6f} (jump {jump:+.6f})")
-            sc_results.append((jump, talk, mname))
-        sc_results.sort(reverse=True, key=lambda r: r[0])
-    else:
-        print("  (backup ears not installed — using the normal check)")
-    if sc_results and sc_results[0][0] > 0.005 and sc_results[0][1] > 0.005:
-        jump, talk, mname = sc_results[0]
-        save_setting("capture", "soundcard")
-        SETTINGS["capture"] = "soundcard"
-        save_setting("capture_mic", mname)
-        SETTINGS["capture_mic"] = mname
-        MIC_NAME, MIC_HOSTAPI = mname, "soundcard"
-        GAIN = min(max(0.03 / max(talk, 1e-6), 1.0), 50.0)
-        _MIC_LIVE = True
-        print(f"  Got you on the backup ears ({mname[:45]}).")
+    hit = _soundcard_probe()
+    if hit:
+        _use_soundcard_mic(*hit)
         return ("Sound check done — my backup ears hear you now. "
                 "Talk to me.")
     # --- 3) input: measure every mic, then have him talk ---
@@ -1214,6 +1184,59 @@ def audio_doctor():
                    "Type to me instead for now.")
     print("==== END SOUND CHECK ====\n")
     return verdict
+
+
+def _soundcard_probe():
+    """Talk test over every WASAPI mic (the backup ears). Returns
+    (jump, talk_level, mic_name) for the mic that heard him best,
+    or None if none did / soundcard is missing."""
+    sc = _sc_module()
+    if sc is None:
+        print("  (backup ears not installed)")
+        return None
+    try:
+        sc_mics = sc.all_microphones(include_loopback=False)
+    except Exception:
+        return None
+    print(f"  Trying my backup ears on {len(sc_mics)} microphones —")
+    print("  count out loud from 1 to 10, keep going till I say done...")
+    try:
+        speak("Count out loud from one to ten, keep going.", allow_barge=False)
+    except Exception:
+        pass
+    time.sleep(0.5)
+    results = []
+    for m in sc_mics:
+        try:
+            mname = m.name
+        except Exception:
+            mname = "?"
+        room = _sc_mic_level(m, 0.8)
+        talk = _sc_mic_level(m, 1.5)
+        if talk < 0 or room < 0:
+            print(f"    [sc] {mname[:45]}: unavailable")
+            continue
+        jump = talk - max(room, 0.0)
+        print(f"    [sc] {mname[:45]}: room {room:.6f} "
+              f"talk {talk:.6f} (jump {jump:+.6f})")
+        results.append((jump, talk, mname))
+    results.sort(reverse=True, key=lambda r: r[0])
+    if results and results[0][0] > 0.005 and results[0][1] > 0.005:
+        return results[0]
+    return None
+
+
+def _use_soundcard_mic(jump, talk, mname):
+    """Lock in the backup-ears mic permanently (survives restarts)."""
+    global MIC_NAME, MIC_HOSTAPI, GAIN, _MIC_LIVE
+    save_setting("capture", "soundcard")
+    SETTINGS["capture"] = "soundcard"
+    save_setting("capture_mic", mname)
+    SETTINGS["capture_mic"] = mname
+    MIC_NAME, MIC_HOSTAPI = mname, "soundcard"
+    GAIN = min(max(0.03 / max(talk, 1e-6), 1.0), 50.0)
+    _MIC_LIVE = True
+    print(f"  Got you on the backup ears ({mname[:45]}).")
 
 
 # mic watcher stays OFF: the persistent input stream is suspected in
@@ -3328,7 +3351,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 75
+BRAIN_VERSION = 76
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -3509,7 +3532,7 @@ init_mic()  # needs speak() defined above; picks the mic that hears him
 if not _MIC_LIVE:
     _CALM = True
     print("(calm mode on — the screen will stay still. Just type to me.)")
-print("Nevaeh brain v75 online — rebuilt. Say 'goodbye' to stop.")
+print("Nevaeh brain v76 online — rebuilt. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
