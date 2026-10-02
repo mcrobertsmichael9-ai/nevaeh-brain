@@ -1070,6 +1070,33 @@ def start_type_box():
                             canvas.itemconfig(state[it], state="hidden")
                 except Exception:
                     pass
+                try:
+                    if "qr_item" not in state:
+                        state["qr_item"] = None
+                        state["qr_txt"] = canvas.create_text(
+                            0, 0, text="", fill="#9beaff",
+                            font=("Segoe UI", max(9, int(11 * S)), "bold"))
+                    qp = find_file("nevaeh_qr.png")
+                    if (qp and state["qr_item"] is None and _PIL):
+                        qim = Image.open(qp).convert("RGB").resize(
+                            (int(150 * S), int(150 * S)), Image.LANCZOS)
+                        state["qr_img"] = ImageTk.PhotoImage(qim)
+                        state["qr_item"] = canvas.create_image(0, 0,
+                            image=state["qr_img"])
+                    if (state["qr_item"] is not None
+                            and time.time() < FACE_STATE.get("qr_until", 0)):
+                        qx, qy = int(95 * S), sh - int(100 * S)
+                        canvas.coords(state["qr_item"], qx, qy)
+                        canvas.coords(state["qr_txt"], qx, qy + int(95 * S))
+                        canvas.itemconfig(state["qr_txt"],
+                                          text="scan to connect")
+                        canvas.itemconfig(state["qr_item"], state="normal")
+                        canvas.itemconfig(state["qr_txt"], state="normal")
+                    elif state["qr_item"] is not None:
+                        canvas.itemconfig(state["qr_item"], state="hidden")
+                        canvas.itemconfig(state["qr_txt"], state="hidden")
+                except Exception:
+                    pass
                 root.after(66, animate)
 
             animate()
@@ -1619,10 +1646,62 @@ def start_phone_remote():
     try:
         srv = HTTPServer(("0.0.0.0", PHONE_PORT), H)
         ip = _nevaeh_lan_ip()
-        print(f"(phone link: open http://{ip}:{PHONE_PORT} on your phone)")
+        url = f"http://{ip}:{PHONE_PORT}"
+        print(f"(phone link: open {url} on your phone)")
+        try:  # QR code for scan-to-connect, shown on her face
+            q = urllib.request.Request(
+                "https://api.qrserver.com/v1/create-qr-code/"
+                f"?size=220x220&data={urllib.parse.quote(url)}",
+                headers={"User-Agent": "NevaehBrain"})
+            with urllib.request.urlopen(q, timeout=20) as r:
+                qd = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "nevaeh_qr.png")
+                with open(qd, "wb") as fh:
+                    fh.write(r.read())
+            FACE_STATE["qr_until"] = time.time() + 90
+            print("(QR code ready — scan it from her face)")
+        except Exception as e:
+            print(f"(QR code unavailable: {e})")
         srv.serve_forever()
     except Exception as e:
         print(f"(phone link off: {e})")
+
+
+
+def setup_autostart():
+    """She puts herself in Windows Startup so she starts on login."""
+    try:
+        startup = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows",
+                               "Start Menu", "Programs", "Startup")
+        d = os.path.dirname(os.path.abspath(__file__))
+        launcher = os.path.join(d, "nevaeh_start.bat")
+        with open(launcher, "w") as f:
+            f.write("@echo off\n"
+                    "cd /d \"%~dp0\"\n"
+                    "for /f \"delims=\" %%F in "
+                    "('dir /b /o-d \"nevaeh_brain (*).py\"') do (\n"
+                    "  start \"Nevaeh\" python \"%%F\"\n"
+                    "  goto :done\n"
+                    ")\n"
+                    ":done\n")
+        import shutil
+        shutil.copy(launcher, os.path.join(startup, "nevaeh_start.bat"))
+        return ("Done — I'll start up by myself every time the computer "
+                "starts now, Michael.")
+    except Exception as e:
+        return f"I couldn't set that up myself ({e})."
+
+
+def remove_autostart():
+    try:
+        p = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows",
+                         "Start Menu", "Programs", "Startup",
+                         "nevaeh_start.bat")
+        if os.path.exists(p):
+            os.remove(p)
+        return "Okay — I won't start with the computer anymore."
+    except Exception as e:
+        return f"I couldn't remove it myself ({e})."
 
 
 STOP_TALKING = threading.Event()  # set when Michael talks over her
@@ -2591,7 +2670,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 60
+BRAIN_VERSION = 61
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -2764,7 +2843,7 @@ def self_diagnose():
     return " ".join(report)
 
 
-print("Nevaeh brain v60 online — voice fixed. Say 'goodbye' to stop.")
+print("Nevaeh brain v61 online — autostart + phone QR. Say 'goodbye' to stop.")
 threading.Thread(target=update_watcher, daemon=True).start()
 print("(secure update channel on — I check for my own upgrades)")
 threading.Thread(target=start_phone_remote, daemon=True).start()
@@ -2931,6 +3010,21 @@ try:
                 play_tictactoe()
                 reply = "Played tic-tac-toe with Michael."
                 streamed = True
+            elif any(p in t for p in ["start with the computer",
+                                             "start on startup",
+                                             "auto start", "start on boot",
+                                             "launch on startup"]):
+                reply = setup_autostart()
+            elif any(p in t for p in ["don't start with the computer",
+                                     "stop auto start",
+                                     "don't auto start"]):
+                reply = remove_autostart()
+            elif "show phone link" in t or "phone link" in t:
+                FACE_STATE["qr_until"] = time.time() + 60
+                ip = _nevaeh_lan_ip()
+                reply = (f"Scan the code on my face, or open "
+                         f"http colon slash slash {ip} colon 8765 "
+                         f"on your phone.")
             elif "face off" in t:
                 face_set_visible(False)
                 reply = "My face is hidden — say 'face on' to bring me back."
