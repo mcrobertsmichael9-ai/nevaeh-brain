@@ -21,6 +21,26 @@ import urllib.request
 
 import av
 
+
+def _crash_log(msg):
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "nevaeh_crash.log"), "a",
+                  encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _excepthook(t, v, tb):
+    import traceback
+    _crash_log("CRASH: " + "".join(
+        traceback.format_exception(t, v, tb))[-3000:])
+    sys.__excepthook__(t, v, tb)
+
+
+_crash_log("=== brain starting ===")
+
 # Fix: installed av version rejects the metadata_errors kwarg faster-whisper passes.
 _orig_av_open = av.open
 
@@ -34,6 +54,8 @@ av.open = _av_open
 
 import shutil
 import sys
+
+sys.excepthook = _excepthook
 
 import cv2
 import numpy as np
@@ -1830,16 +1852,20 @@ def speak(text, allow_barge=True):
                 / 32768.0
         if nch == 2:
             audio = audio.reshape(-1, 2).mean(axis=1).astype(np.float32)
-        if allow_barge and MIC is not None:
-            STOP_TALKING.clear()
-            _play_with_barge_in(audio, sr)
-        else:
-            try:
+        try:
+            if allow_barge and MIC is not None and _MIC_WATCH_OK:
+                STOP_TALKING.clear()
+                _play_with_barge_in(audio, sr)
+            else:
                 sd.play(audio, samplerate=sr)
                 sd.wait()
-            except Exception:
+        except Exception as pe:
+            print(f"(playback glitch: {pe} — using Windows player)")
+            try:
                 import winsound  # last resort: the old Windows player
                 winsound.PlaySound(REPLY_WAV, winsound.SND_FILENAME)
+            except Exception as we:
+                print(f"(Windows player also failed: {we})")
     except Exception as e:
         print(f"(voice glitch: {e})")
     finally:
@@ -2701,7 +2727,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 63
+BRAIN_VERSION = 64
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -2877,7 +2903,18 @@ def self_diagnose():
     return " ".join(report)
 
 
-print("Nevaeh brain v63 online — smooth voice. Say 'goodbye' to stop.")
+print("Nevaeh brain v64 online — black-box recorder. Say 'goodbye' to stop.")
+try:
+    _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "nevaeh_crash.log")
+    if os.path.exists(_cl):
+        lines = open(_cl, encoding="utf-8").read().strip().splitlines()
+        crashes = [l for l in lines if l.startswith("[") and "CRASH:" in l]
+        if crashes:
+            print("(!! last time I crashed: " + crashes[-1][-220:] + ")")
+            print("(full details in nevaeh_crash.log next to the brain)")
+except Exception:
+    pass
 threading.Thread(target=update_watcher, daemon=True).start()
 print("(secure update channel on — I check for my own upgrades)")
 threading.Thread(target=start_phone_remote, daemon=True).start()
