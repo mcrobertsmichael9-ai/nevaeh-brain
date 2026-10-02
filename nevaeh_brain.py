@@ -690,6 +690,7 @@ def _mic_troubleshoot():
 
 
 _MIC_LIVE = True  # False when mic setup never heard him → typed-only mode
+_CALM = False  # calm mode: still screen, no proactive chatter — typing-friendly
 
 
 def init_mic():
@@ -1424,7 +1425,10 @@ def listen(timeout_secs=20):
 
 
 def _listen_inner(timeout_secs=20):
-    print("\nListening... speak now. (volume meter below — talk and watch it move)")
+    if _CALM:
+        print("(listening)", flush=True)
+    else:
+        print("\nListening... speak now. (volume meter below — talk and watch it move)")
     chunks, quiet, heard_speech = [], 0, False
     for _ in range(int(timeout_secs * 2)):  # 0.5s chunks
         if not TYPE_QUEUE.empty():
@@ -1438,7 +1442,8 @@ def _listen_inner(timeout_secs=20):
         chunks.append(chunk)
         rms = float(np.sqrt(np.mean(np.nan_to_num(
             chunk ** 2, nan=0.0, posinf=1e12, neginf=1e12))))
-        print("\r" + volume_bar(rms) + f" {rms:.4f}", end="", flush=True)
+        if not _CALM:
+            print("\r" + volume_bar(rms) + f" {rms:.4f}", end="", flush=True)
         if rms > NOISE_FLOOR:
             heard_speech = True
             quiet = 0
@@ -3020,7 +3025,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 70
+BRAIN_VERSION = 71
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -3197,7 +3202,10 @@ def self_diagnose():
 
 
 init_mic()  # needs speak() defined above; picks the mic that hears him
-print("Nevaeh brain v70 online — rebuilt. Say 'goodbye' to stop.")
+if not _MIC_LIVE:
+    _CALM = True
+    print("(calm mode on — the screen will stay still. Just type to me.)")
+print("Nevaeh brain v71 online — rebuilt. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
@@ -3262,11 +3270,11 @@ try:
                         and not _ft.is_alive()):
                     _face_deaths = globals().get("_face_deaths", 0) + 1
                     globals()["_face_deaths"] = _face_deaths
-                    if _face_deaths == 4:
+                    if _face_deaths == 2:
                         print("(my face window keeps crashing — I'll stay "
                               "in this text window. Type to me here, it "
                               "all works the same.)")
-                    elif _face_deaths < 4:
+                    elif _face_deaths < 2:
                         print("(my face window died — restarting it myself)")
                         try:
                             start_type_box()
@@ -3274,7 +3282,8 @@ try:
                             print(f"(face restart failed: {fe})")
                 elif _ft is not None and _ft.is_alive():
                     globals()["_face_deaths"] = 0
-                if not paused and SETTINGS.get("greet_me", "on").lower() == "on":
+                if (not paused and not _CALM
+                        and SETTINGS.get("greet_me", "on").lower() == "on"):
                     present = michael_present()
                     if present and not was_present:
                         speak("Hey Michael! Good to see you.")
@@ -3317,7 +3326,7 @@ try:
                 if not _MIC_LIVE:
                     # mic never heard him — stay in typed mode, nag rarely
                     _last_nag = globals().get("_last_typed_nag", 0)
-                    if time.time() - _last_nag > 120:
+                    if time.time() - _last_nag > 120 and not _CALM:
                         globals()["_last_typed_nag"] = time.time()
                         print("(my mic isn't hearing you — type to me in "
                               "the type box, I read everything)")
@@ -3335,7 +3344,7 @@ try:
                         pass
                     init_mic()
                     continue
-                if _quiet_rounds >= 2:
+                if _quiet_rounds >= 2 and not _CALM:
                     globals()["_quiet_rounds"] = 0
                     last_spoken = proactive_nudge()
                     last_active = time.time()
@@ -3412,6 +3421,15 @@ try:
                                              "run diagnostics"]):
                 print("(running self-diagnosis...)")
                 reply = self_diagnose()
+            elif any(p in t for p in ["calm mode", "quiet mode",
+                                      "calm down", "stop moving"]):
+                globals()["_CALM"] = True
+                reply = ("Calm mode — the screen will stay still and I'll "
+                         "only speak when you type to me.")
+            elif any(p in t for p in ["normal mode", "lively mode",
+                                      "wake up"]):
+                globals()["_CALM"] = False
+                reply = "Back to normal — I'm all ears."
             elif any(p in t for p in ["check my sound", "sound check",
                                       "audio test", "test my mic",
                                       "test the mic", "mic test",
