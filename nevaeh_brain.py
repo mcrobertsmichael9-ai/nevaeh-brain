@@ -689,16 +689,21 @@ def _mic_troubleshoot():
     print("  4. Unplug any USB mic/headset you are not using, restart me.")
 
 
+_MIC_LIVE = True  # False when mic setup never heard him → typed-only mode
+
+
 def init_mic():
-    """Pick the microphone that can actually hear Michael. She asks him
-    to say 'hello Nevaeh' and measures which mic heard him — no guessing."""
-    global MIC, GAIN, NOISE_FLOOR
+    """Pick the microphone that actually hears Michael: measures room noise
+    first, asks him to keep talking, and picks the mic with the biggest
+    jump over its own baseline — no guessing, immune to speaker echo."""
+    global MIC, GAIN, NOISE_FLOOR, _MIC_LIVE
     print("\nLooking for your microphone...")
     try:
         devs = sd.query_devices()
     except Exception as e:
         print(f"  Could not list microphones: {e}")
         MIC, GAIN, NOISE_FLOOR = None, 1.0, 0.02
+        _MIC_LIVE = False
         return
     try:
         default_in = sd.default.device[0]
@@ -715,6 +720,7 @@ def init_mic():
     if not inputs:
         print("  No microphones found at all.")
         MIC, GAIN, NOISE_FLOOR = default_in, 1.0, 0.02
+        _MIC_LIVE = False
         _mic_troubleshoot()
         return
 
@@ -724,35 +730,198 @@ def init_mic():
     if not usable:
         print("  None of the microphones would open.")
         MIC, GAIN, NOISE_FLOOR = default_in, 1.0, 0.02
+        _MIC_LIVE = False
         _mic_troubleshoot()
         return
 
-    # interactive: she asks, he speaks, she measures who heard him
-    print("\n  Say 'hello' out loud in 3... 2... 1... NOW")
-    try:
-        speak("Say hello out loud.", allow_barge=False)
-    except Exception:
-        pass
-    time.sleep(1.0)
+    # interactive: baseline is the health check (room noise, measured before
+    # any prompt). He keeps talking while each candidate is measured, and
+    # the mic with the biggest jump over its own baseline wins. Immune to
+    # speaker echo fooling the test and to one-shot timing misses.
     cands = sorted(usable, key=lambda i: health[i], reverse=True)[:3]
     if default_in in usable and default_in not in cands:
         cands.append(default_in)
-    heard = {}
+    names = {i: (devs[i]["name"] or "").strip()[:45] for i in cands}
+    print("\n  Now keep saying 'hello' over and over until I say got you —")
+    print("  Say 'hello' out loud in 3... 2... 1... NOW")
+    try:
+        speak("Keep saying hello until I say got you.", allow_barge=False)
+    except Exception:
+        pass
+    time.sleep(0.8)
+    heard, delta = {}, {}
     for i in cands:
-        heard[i] = _mic_level(i, 1.5)
-        print(f"    [{i}] heard you at {heard[i]:.6f}")
-    best = max(heard, key=lambda i: heard[i])
-    if heard[best] < 0.002:
+        heard[i] = _mic_level(i, 2.0)
+        delta[i] = heard[i] - max(health[i], 0.0)
+        print(f"    [{i}] speech {heard[i]:.6f} "
+              f"(room was {health[i]:.6f}, jump {delta[i]:+.6f})")
+    best = max(delta, key=lambda i: delta[i])
+    if delta[best] < 0.005:
         print("  I didn't hear you on any microphone.")
         MIC = default_in if default_in in usable else cands[0]
         GAIN = 1.0
+        _MIC_LIVE = False
         _mic_troubleshoot()
+        print("  (I'll read what you TYPE in the type box instead. "
+              "Say 'check my sound' any time to retry the mic.)")
     else:
         MIC = best
         GAIN = min(max(0.03 / max(heard[best], 1e-6), 1.0), 50.0)
-        print(f"  Got you — using mic [{best}] (gain x{GAIN:.1f}).")
+        _MIC_LIVE = True
+        print(f"  Got you — using mic [{best}] "
+              f"({names[best]}, gain x{GAIN:.1f}).")
     NOISE_FLOOR = 0.02
     print("  Mic ready.")
+
+
+def _measure_mic(device, secs):
+    """RMS level of one mic over `secs` seconds. -1.0 if it won't open."""
+    try:
+        rec = sd.rec(int(SAMPLE_RATE * secs), samplerate=SAMPLE_RATE,
+                     channels=1, dtype="float32", device=device)
+        sd.wait()
+        return float(np.sqrt(np.mean(np.nan_to_num(
+            rec ** 2, nan=0.0, posinf=1e12))))
+    except Exception:
+        return -1.0
+
+
+def _ask_yes_no(question, timeout=20):
+    """Ask Michael a yes/no question — he can type it or say it."""
+    print(f"\n{question} (type yes or no — or say it out loud)")
+    try:
+        speak(question, allow_barge=False)
+    except Exception:
+        pass
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        h = poll_typed()
+        if h:
+            t = h.lower()
+            if any(w in t for w in ("yes", "yeah", "yep", "yup")):
+                return True
+            if any(w in t for w in ("no", "nope", "not")):
+                return False
+        time.sleep(0.5)
+    h = listen(timeout_secs=8)
+    if h:
+        t = h.lower()
+        if any(w in t for w in ("yes", "yeah", "yep", "yup")):
+            return True
+        if any(w in t for w in ("no", "nope", "not")):
+            return False
+    return None
+
+
+def audio_doctor():
+    """Her self-run sound check: tests speaker output with a beep, then
+    measures every microphone while he talks and switches to one that
+    hears him. Trigger: 'check my sound'. Reports plainly what's broken."""
+    global MIC, GAIN, _MIC_LIVE
+    print("\n==== SOUND CHECK ====")
+    # --- 1) output: play a test beep ---
+    sr, secs = 22050, 1.0
+    n = int(sr * secs)
+    tone = (0.5 * np.sin(2 * np.pi * 440.0 * np.arange(n) / sr)
+            ).astype(np.float32)
+    beep_path = os.path.join(HERE, "nevaeh_beep.wav")
+    beep_ok = True
+    try:
+        import wave
+        with wave.open(beep_path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes((tone * 32767).astype(np.int16).tobytes())
+    except Exception as e:
+        print(f"  (couldn't make the test beep: {e})")
+        beep_ok = False
+    heard_beep = None
+    if beep_ok:
+        print("  Playing a test beep...")
+        try:
+            import winsound
+            winsound.PlaySound(beep_path, winsound.SND_FILENAME)
+        except Exception as e:
+            print(f"  (Windows player failed: {e})")
+        heard_beep = _ask_yes_no("Did you hear a beep")
+        if heard_beep is False:
+            print("  Trying the backup player...")
+            try:
+                sd.play(tone, samplerate=sr)
+                sd.wait()
+            except Exception as e:
+                print(f"  (backup player failed: {e})")
+            heard_beep = _ask_yes_no("Did you hear it this time")
+    if heard_beep is False:
+        print("\n  My speaker sound isn't reaching you. On the laptop:")
+        print("  1. Click the speaker icon (bottom-right) — volume up, "
+              "not muted.")
+        print("  2. Click it to see the output list — pick your laptop "
+              "speakers, not a TV or Bluetooth that's off.")
+    elif heard_beep is True:
+        print("  Speaker output works.")
+    else:
+        print("  (no answer — moving on to the mic test)")
+    # --- 2) input: measure every mic, then have him talk ---
+    print("\n  Measuring every microphone — stay quiet...")
+    try:
+        devs = sd.query_devices()
+    except Exception as e:
+        print(f"  Could not list microphones: {e}")
+        return "The sound check hit a glitch listing microphones."
+    levels = []
+    for i, d in enumerate(devs):
+        name = (d["name"] or "").strip()
+        if d["max_input_channels"] < 1 or "stereo mix" in name.lower():
+            continue
+        lvl = _measure_mic(i, 1.5)
+        tag = "won't open" if lvl < 0 else f"{lvl:.6f}"
+        print(f"    [{i}] {name[:45]}: {tag}")
+        if lvl >= 0:
+            levels.append((lvl, i, name))
+    if not levels:
+        print("  No microphones would open at all.")
+        return "I couldn't open any microphone on this laptop."
+    print("\n  Now KEEP TALKING — say anything until I say done...")
+    try:
+        speak("Keep talking until I say done.", allow_barge=False)
+    except Exception:
+        pass
+    time.sleep(0.5)
+    talk = []
+    for lvl0, i, name in levels:
+        lvl = _measure_mic(i, 2.0)
+        jump = lvl - max(lvl0, 0.0)
+        print(f"    [{i}] while you talked: {lvl:.6f} "
+              f"(jump {jump:+.6f})")
+        talk.append((jump, lvl, i, name))
+    print("  (done — thanks)")
+    talk.sort(reverse=True)
+    best_jump, best_lvl, best_i, best_name = talk[0]
+    if best_jump > 0.005 and best_lvl > 0.005:
+        if best_i != MIC:
+            MIC = best_i
+            GAIN = min(max(0.03 / max(best_lvl, 1e-6), 1.0), 50.0)
+            print(f"  Switched to mic [{best_i}] ({best_name[:45]}).")
+        else:
+            print(f"  Mic [{best_i}] hears you fine — keeping it.")
+        _MIC_LIVE = True
+        verdict = f"Sound check done — mic {best_i} hears you now."
+    else:
+        _MIC_LIVE = False
+        print("\n  I couldn't hear you on ANY microphone.")
+        print("  1. Tap the mic-mute key on the keyboard (amber = muted).")
+        print("  2. Windows Settings, System, Sound, Input: pick your mic,")
+        print("     and check the volume bar moves when you talk.")
+        print("  3. Settings, Privacy, Microphone must be ON, and let "
+              "desktop apps use it.")
+        print("  (Until then, type to me in the type box — I read "
+              "everything.)")
+        verdict = ("Sound check done — I can't hear any mic. "
+                   "Type to me instead for now.")
+    print("==== END SOUND CHECK ====\n")
+    return verdict
 
 
 # mic watcher stays OFF: the persistent input stream is suspected in
@@ -2851,7 +3020,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 68
+BRAIN_VERSION = 69
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -3028,7 +3197,7 @@ def self_diagnose():
 
 
 init_mic()  # needs speak() defined above; picks the mic that hears him
-print("Nevaeh brain v68 online — rebuilt. Say 'goodbye' to stop.")
+print("Nevaeh brain v69 online — rebuilt. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
@@ -3105,12 +3274,37 @@ try:
             if heard is not None:
                 is_typed = True
                 print("TYPED:", heard)
+            elif not _MIC_LIVE:
+                time.sleep(2)  # dead mic: don't burn 20s on voice listen
             else:
                 heard = listen()
         if not heard:
             if not paused:
                 _quiet_rounds = globals().get("_quiet_rounds", 0) + 1
                 globals()["_quiet_rounds"] = _quiet_rounds
+                _dead_rounds = globals().get("_dead_rounds", 0) + 1
+                globals()["_dead_rounds"] = _dead_rounds
+                if not _MIC_LIVE:
+                    # mic never heard him — stay in typed mode, nag rarely
+                    _last_nag = globals().get("_last_typed_nag", 0)
+                    if time.time() - _last_nag > 120:
+                        globals()["_last_typed_nag"] = time.time()
+                        print("(my mic isn't hearing you — type to me in "
+                              "the type box, I read everything)")
+                    globals()["_quiet_rounds"] = 0
+                    globals()["_dead_rounds"] = 0
+                    continue
+                if _dead_rounds >= 6:
+                    globals()["_dead_rounds"] = 0
+                    globals()["_quiet_rounds"] = 0
+                    print("(I've had trouble hearing — re-checking the mic)")
+                    try:
+                        speak("I'm having trouble hearing you — "
+                              "let's check the mic.", allow_barge=False)
+                    except Exception:
+                        pass
+                    init_mic()
+                    continue
                 if _quiet_rounds >= 2:
                     globals()["_quiet_rounds"] = 0
                     last_spoken = proactive_nudge()
@@ -3119,6 +3313,7 @@ try:
             print("(heard nothing, listening again)")
             continue
         globals()["_quiet_rounds"] = 0
+        globals()["_dead_rounds"] = 0
         if similar(heard, last_spoken):
             print("(ignored my own voice, listening again)")
             continue
@@ -3187,6 +3382,12 @@ try:
                                              "run diagnostics"]):
                 print("(running self-diagnosis...)")
                 reply = self_diagnose()
+            elif any(p in t for p in ["check my sound", "sound check",
+                                      "audio test", "test my mic",
+                                      "test the mic", "mic test",
+                                      "check the mic"]):
+                print("(running sound check...)")
+                reply = audio_doctor()
             elif any(p in t for p in ["check for updates", "check for upgrade",
                                              "update yourself", "any updates"]):
                 ver = stage_brain_update()
