@@ -675,8 +675,9 @@ else:
 print(f"Mic gain: x{GAIN:.1f}")
 NOISE_FLOOR = 0.02
 print("Mic ready.")
-if MIC is not None:
-    threading.Thread(target=_mic_watcher, daemon=True).start()
+# mic watcher stays OFF: the persistent input stream is suspected in
+# the startup crashes. Sentence-boundary talk-over detection is used
+# instead (see _michael_talking).
 
 
 def volume_bar(rms):
@@ -1377,7 +1378,7 @@ def think_and_speak(text, tiktok=False):
     full = []
     STOP_TALKING.clear()
     while True:
-        if STOP_TALKING.is_set():
+        if _michael_talking():
             break  # Michael started talking — drop the rest, listen
         try:
             s = q.get(timeout=0.5)
@@ -1769,6 +1770,23 @@ def _mic_watcher():
         print(f"(mic watcher off — no talk-over detection: {e})")
 
 
+def _michael_talking():
+    """True if Michael is speaking right now. One quick 250ms mic peek —
+    never touches the mic while she is playing audio."""
+    if MIC is None:
+        return False
+    try:
+        time.sleep(0.25)  # let her own speaker echo die first
+        rec = sd.rec(int(SAMPLE_RATE * 0.25), samplerate=SAMPLE_RATE,
+                     channels=1, dtype="float32", device=MIC)
+        sd.wait()
+        rms = float(np.sqrt(np.mean(np.nan_to_num(
+            rec ** 2, nan=0.0, posinf=1e12))))
+        return rms > max(NOISE_FLOOR * 4.0, 0.02)
+    except Exception:
+        return False
+
+
 def _play_with_barge_in(audio, sr):
     """Play her voice; watch the live mic level. If Michael starts
     talking, stop her mid-sentence and hand him the floor. Returns True
@@ -1853,19 +1871,15 @@ def speak(text, allow_barge=True):
         if nch == 2:
             audio = audio.reshape(-1, 2).mean(axis=1).astype(np.float32)
         try:
-            if allow_barge and MIC is not None and _MIC_WATCH_OK:
-                STOP_TALKING.clear()
-                _play_with_barge_in(audio, sr)
-            else:
+            import winsound  # proven on this machine — primary player
+            winsound.PlaySound(REPLY_WAV, winsound.SND_FILENAME)
+        except Exception as we:
+            print(f"(Windows player failed: {we} — trying sounddevice)")
+            try:
                 sd.play(audio, samplerate=sr)
                 sd.wait()
-        except Exception as pe:
-            print(f"(playback glitch: {pe} — using Windows player)")
-            try:
-                import winsound  # last resort: the old Windows player
-                winsound.PlaySound(REPLY_WAV, winsound.SND_FILENAME)
-            except Exception as we:
-                print(f"(Windows player also failed: {we})")
+            except Exception as pe:
+                print(f"(voice glitch: {pe})")
     except Exception as e:
         print(f"(voice glitch: {e})")
     finally:
@@ -2727,7 +2741,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 64
+BRAIN_VERSION = 65
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -2903,7 +2917,7 @@ def self_diagnose():
     return " ".join(report)
 
 
-print("Nevaeh brain v64 online — black-box recorder. Say 'goodbye' to stop.")
+print("Nevaeh brain v65 online — stable. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
@@ -2940,11 +2954,9 @@ try:
             ver = _PENDING_UPDATE[0]
             newpath = install_staged_update()
             if newpath:
-                speak(f"I've got my version {ver} upgrade. "
-                      "Restarting myself now, Michael.")
-                subprocess.Popen([sys.executable, newpath])
-                print("(restarting into the new brain)")
-                break
+                print(f"(my v{ver} upgrade is downloaded: "
+                      f"{os.path.basename(newpath)})")
+                print("(I'll switch to it next time you restart me)")
         if time.time() - last_check > 30:
             last_check = time.time()
             try:
