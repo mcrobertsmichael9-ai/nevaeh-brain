@@ -639,7 +639,10 @@ print("Calibrating mic... stay quiet for one second.")
 _calib = sd.rec(int(SAMPLE_RATE * 1.0), samplerate=SAMPLE_RATE,
                 channels=1, dtype="float32", device=MIC)
 sd.wait()
-room_level = float(np.sqrt(np.mean(_calib ** 2)))
+room_level = float(np.sqrt(np.mean(np.nan_to_num(
+    _calib ** 2, nan=0.0, posinf=1e12))))
+if room_level != room_level:  # NaN mic -> treat as silent
+    room_level = 0.0
 print(f"Room level: {room_level:.6f}")
 
 if room_level < 0.0005:
@@ -653,7 +656,12 @@ print("Mic ready.")
 
 
 def volume_bar(rms):
-    n = max(0, min(30, int(rms * 300)))
+    try:
+        if rms != rms or rms in (float("inf"), float("-inf")):
+            rms = 0.0
+        n = max(0, min(30, int(rms * 300)))
+    except Exception:
+        n = 0
     return "[" + "#" * n + "-" * (30 - n) + "]"
 
 
@@ -1151,9 +1159,11 @@ def _listen_inner(timeout_secs=20):
         chunk = sd.rec(int(SAMPLE_RATE * 0.5), samplerate=SAMPLE_RATE,
                        channels=1, dtype="float32", device=MIC)
         sd.wait()
-        chunk = chunk * GAIN
+        chunk = np.nan_to_num(chunk * GAIN, nan=0.0, posinf=0.0,
+                                neginf=0.0)
         chunks.append(chunk)
-        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        rms = float(np.sqrt(np.mean(np.nan_to_num(
+            chunk ** 2, nan=0.0, posinf=1e12, neginf=1e12))))
         print("\r" + volume_bar(rms) + f" {rms:.4f}", end="", flush=True)
         if rms > NOISE_FLOOR:
             heard_speech = True
@@ -1718,21 +1728,24 @@ def _play_with_barge_in(audio, sr):
             rec = sd.rec(int(SAMPLE_RATE * 0.2), samplerate=SAMPLE_RATE,
                          channels=1, dtype="float32", device=MIC)
             sd.wait()
-            room = float(np.sqrt(np.mean(rec ** 2))) + 1e-6
+            room = float(np.sqrt(np.mean(np.nan_to_num(
+                rec ** 2, nan=0.0, posinf=1e12)))) + 1e-6
             time.sleep(0.7)  # let her voice reach the speakers
             bleed = 1e-6
             for _ in range(6):  # her own voice bleeding into the mic
                 rec = sd.rec(int(SAMPLE_RATE * 0.1), samplerate=SAMPLE_RATE,
                              channels=1, dtype="float32", device=MIC)
                 sd.wait()
-                bleed = max(bleed, float(np.sqrt(np.mean(rec ** 2))))
+                bleed = max(bleed, float(np.sqrt(np.mean(np.nan_to_num(
+                    rec ** 2, nan=0.0, posinf=1e12)))))
             thresh = max(bleed * 2.0, room * 6.0, 0.015)
             hot = 0
             while not result["done"]:
                 rec = sd.rec(int(SAMPLE_RATE * 0.1), samplerate=SAMPLE_RATE,
                              channels=1, dtype="float32", device=MIC)
                 sd.wait()
-                rms = float(np.sqrt(np.mean(rec ** 2)))
+                rms = float(np.sqrt(np.mean(np.nan_to_num(
+                    rec ** 2, nan=0.0, posinf=1e12))))
                 if rms > thresh:
                     hot += 1
                     if hot >= 3:  # 300ms loud — that's him, not echo
@@ -2670,7 +2683,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 61
+BRAIN_VERSION = 62
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -2779,7 +2792,10 @@ def self_diagnose():
                                  samplerate=SAMPLE_RATE, channels=1,
                                  dtype="float32", device=i)
                     sd.wait()
-                    lvl = float(np.sqrt(np.mean(rec ** 2)))
+                    lvl = float(np.sqrt(np.mean(np.nan_to_num(
+                        rec ** 2, nan=0.0, posinf=1e12))))
+                    if lvl != lvl:  # mic sending garbage, not signal
+                        lvl = -1.0
                     cands.append((lvl, i, dev["name"]))
                 except Exception:
                     continue
@@ -2843,7 +2859,7 @@ def self_diagnose():
     return " ".join(report)
 
 
-print("Nevaeh brain v61 online — autostart + phone QR. Say 'goodbye' to stop.")
+print("Nevaeh brain v62 online — crash-proof mic. Say 'goodbye' to stop.")
 threading.Thread(target=update_watcher, daemon=True).start()
 print("(secure update channel on — I check for my own upgrades)")
 threading.Thread(target=start_phone_remote, daemon=True).start()

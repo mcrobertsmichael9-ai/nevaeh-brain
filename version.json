@@ -1,7 +1,7 @@
 {
-  "version": 61,
+  "version": 62,
   "url": "https://raw.githubusercontent.com/mcrobertsmichael9-ai/nevaeh-brain/main/nevaeh_brain.py",
-  "sha256": "757ade1c5577f6c457f2a3b5e8da1f8492ee68dd245d9128e32bb20dd09c9ab5",
-  "signature": "364e6ba58a1495043c8818c4e00c2dbc8e88383fc30b1763ae0d3a1660e4a0f7595187b00b589c6c62f7dcbc4d2f79a2728bc75eab954fcbf957f0d7b7943704",
+  "sha256": "1fb938a6b1df1bc7c3db59c5370414c756ad05dd8a0ebba5df8bb133313aecc5",
+  "signature": "7bb4e6f6df0a42cdce5c9da426254a8256b664f04fb969d22bf56d247b055761cb013b7ce34539b6dadc8c5356409ba9c0e485538a5874d25fe9cfb681b35108",
   "files": []
 }
