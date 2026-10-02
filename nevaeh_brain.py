@@ -653,6 +653,8 @@ else:
 print(f"Mic gain: x{GAIN:.1f}")
 NOISE_FLOOR = 0.02
 print("Mic ready.")
+if MIC is not None:
+    threading.Thread(target=_mic_watcher, daemon=True).start()
 
 
 def volume_bar(rms):
@@ -1715,57 +1717,74 @@ def remove_autostart():
 
 
 STOP_TALKING = threading.Event()  # set when Michael talks over her
+_MIC_RMS = 0.0      # live mic loudness, updated by the watcher thread
+_MIC_WATCH_OK = False
+
+
+def _mic_watcher():
+    """One gentle input stream for her whole life. Feeds _MIC_RMS so the
+    barge-in check never has to open/close the mic mid-speech (that
+    churn is what made her voice choppy)."""
+    global _MIC_RMS, _MIC_WATCH_OK
+    try:
+        def cb(indata, frames, tinfo, status):
+            global _MIC_RMS
+            try:
+                d = np.nan_to_num(indata[:, 0].astype(np.float64),
+                                  nan=0.0, posinf=0.0, neginf=0.0)
+                _MIC_RMS = float(np.sqrt(np.mean(d * d)))
+            except Exception:
+                pass
+
+        _MIC_WATCH_OK = True
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                            dtype="float32", device=MIC, callback=cb,
+                            blocksize=int(SAMPLE_RATE * 0.1)):
+            while True:
+                time.sleep(1)
+    except Exception as e:
+        _MIC_WATCH_OK = False
+        print(f"(mic watcher off — no talk-over detection: {e})")
 
 
 def _play_with_barge_in(audio, sr):
-    """Play her voice; watch the mic the whole time. If Michael starts
+    """Play her voice; watch the live mic level. If Michael starts
     talking, stop her mid-sentence and hand him the floor. Returns True
-    when she was interrupted."""
-    result = {"barged": False, "done": False}
-
-    def monitor():
-        try:
-            rec = sd.rec(int(SAMPLE_RATE * 0.2), samplerate=SAMPLE_RATE,
-                         channels=1, dtype="float32", device=MIC)
-            sd.wait()
-            room = float(np.sqrt(np.mean(np.nan_to_num(
-                rec ** 2, nan=0.0, posinf=1e12)))) + 1e-6
-            time.sleep(0.7)  # let her voice reach the speakers
-            bleed = 1e-6
-            for _ in range(6):  # her own voice bleeding into the mic
-                rec = sd.rec(int(SAMPLE_RATE * 0.1), samplerate=SAMPLE_RATE,
-                             channels=1, dtype="float32", device=MIC)
-                sd.wait()
-                bleed = max(bleed, float(np.sqrt(np.mean(np.nan_to_num(
-                    rec ** 2, nan=0.0, posinf=1e12)))))
-            thresh = max(bleed * 2.0, room * 6.0, 0.015)
-            hot = 0
-            while not result["done"]:
-                rec = sd.rec(int(SAMPLE_RATE * 0.1), samplerate=SAMPLE_RATE,
-                             channels=1, dtype="float32", device=MIC)
-                sd.wait()
-                rms = float(np.sqrt(np.mean(np.nan_to_num(
-                    rec ** 2, nan=0.0, posinf=1e12))))
-                if rms > thresh:
-                    hot += 1
-                    if hot >= 3:  # 300ms loud — that's him, not echo
-                        result["barged"] = True
-                        STOP_TALKING.set()
-                        try:
-                            sd.stop()
-                        except Exception:
-                            pass
-                        return
-                else:
-                    hot = 0
-        except Exception:
-            pass
-
-    threading.Thread(target=monitor, daemon=True).start()
+    when she was interrupted. No mic stream churn — just polls _MIC_RMS."""
+    if not _MIC_WATCH_OK:
+        sd.play(audio, samplerate=sr)
+        sd.wait()
+        return False
+    room = _MIC_RMS + 1e-6
     sd.play(audio, samplerate=sr)
-    sd.wait()
-    result["done"] = True
-    return result["barged"]
+    time.sleep(0.7)  # let her voice reach the speakers
+    bleed = _MIC_RMS + 1e-6
+    for _ in range(4):  # her own voice bleeding into the mic
+        time.sleep(0.1)
+        bleed = max(bleed, _MIC_RMS + 1e-6)
+    thresh = max(bleed * 2.2, room * 6.0, 0.02)
+    hot = 0
+    dur = len(audio) / float(sr)
+    t0 = time.time()
+    while time.time() - t0 < dur + 0.5:
+        time.sleep(0.1)
+        if _MIC_RMS > thresh:
+            hot += 1
+            if hot >= 4:  # 400ms loud — that's him, not echo
+                STOP_TALKING.set()
+                try:
+                    sd.stop()
+                except Exception:
+                    pass
+                print("(she stopped — you're talking, she's listening)")
+                return True
+        else:
+            hot = 0
+    try:
+        sd.wait()
+    except Exception:
+        pass
+    return False
 
 
 def speak(text, allow_barge=True):
@@ -1813,8 +1832,7 @@ def speak(text, allow_barge=True):
             audio = audio.reshape(-1, 2).mean(axis=1).astype(np.float32)
         if allow_barge and MIC is not None:
             STOP_TALKING.clear()
-            if _play_with_barge_in(audio, sr):
-                print("(she stopped — you're talking, she's listening)")
+            _play_with_barge_in(audio, sr)
         else:
             try:
                 sd.play(audio, samplerate=sr)
@@ -2683,7 +2701,7 @@ def _bcheckvalid(sig, msg, pub):
         raise ValueError("bad signature")
 
 
-BRAIN_VERSION = 62
+BRAIN_VERSION = 63
 UPDATE_MANIFEST_URL = ("https://raw.githubusercontent.com/"
                        "mcrobertsmichael9-ai/nevaeh-brain/main/version.json")
 UPDATE_PUBKEY = bytes.fromhex(
@@ -2859,7 +2877,7 @@ def self_diagnose():
     return " ".join(report)
 
 
-print("Nevaeh brain v62 online — crash-proof mic. Say 'goodbye' to stop.")
+print("Nevaeh brain v63 online — smooth voice. Say 'goodbye' to stop.")
 threading.Thread(target=update_watcher, daemon=True).start()
 print("(secure update channel on — I check for my own upgrades)")
 threading.Thread(target=start_phone_remote, daemon=True).start()
