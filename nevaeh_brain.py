@@ -1,4 +1,7 @@
-"""Nevaeh brain v6: listen -> think -> speak loop, now with eyes.
+"""Nevaeh brain v77: type -> think -> speak loop, now with eyes.
+v77: voice INPUT removed per Michael (mic was never reliable) — typed
+commands only, she still talks back out loud. Parallel speech pipeline:
+sentence N+1 synthesizes while sentence N plays."""
 
 Setup: put this file in the same folder as en_US-amy-medium.onnx,
 then run:  python nevaeh_brain.py
@@ -144,6 +147,8 @@ def find_file(name):
     return max(cands, key=os.path.getmtime) if cands else None
 MODEL = "llama3.1:8b"
 FAST_MODEL = "llama3.2:3b"  # small + much faster on CPU; auto-downloaded once
+VOICE_INPUT = False  # v77: mic input REMOVED per Michael 2026-10-03 —
+# typed input only. She still talks back out loud (voice output kept).
 VISION_MODEL_FAST = "moondream"   # small, quick, occasionally invents urns
 VISION_MODEL_SHARP = "llava:7b"   # much sharper, downloaded once in background
 SAMPLE_RATE = 16000
@@ -1902,12 +1907,15 @@ def wants_facts(text):
 
 def think_and_speak(text, tiktok=False):
     """Stream the reply from Ollama and speak each sentence the moment it's
-    ready — she starts talking in ~2 seconds instead of waiting for the
-    whole reply. Returns the full reply text."""
+    ready — v77: synthesis runs on its own thread, so sentence N+1 is
+    already voiced while sentence N plays. No dead air between sentences.
+    Returns the full reply text."""
     prompt = build_tiktok_prompt(text) if tiktok else build_prompt(text)
     use_big = wants_facts(text) or tiktok
     print("(looking that up...)" if use_big else "(thinking...)", flush=True)
-    q = queue.Queue()
+    synth_q = queue.Queue()  # (idx, sentence) -> synthesizer thread
+    play_q = queue.Queue()   # (idx, sentence, wav) -> player, in order
+    idx_counter = [0]
 
     def gen():
         try:
@@ -1943,33 +1951,54 @@ def think_and_speak(text, tiktok=False):
                                 sent = m.group(1).strip()
                                 buf = buf[m.end():]
                                 if sent:
-                                    q.put(sent)
+                                    synth_q.put((idx_counter[0], sent))
+                                    idx_counter[0] += 1
                     if buf.strip():
-                        q.put(buf.strip())
-                    q.put(None)
+                        synth_q.put((idx_counter[0], buf.strip()))
+                        idx_counter[0] += 1
+                    synth_q.put(None)
                     return
                 except Exception:
                     continue
         except Exception:
             pass
-        q.put(None)
+        synth_q.put(None)
+
+    def synth_worker():
+        """Voice sentence N+1 while sentence N is still playing."""
+        while True:
+            item = synth_q.get()
+            if item is None:
+                play_q.put(None)
+                return
+            idx, sent = item
+            wav = synth_sentence_wav(sent, tag=str(idx % 8))
+            play_q.put((idx, sent, wav))
 
     threading.Thread(target=gen, daemon=True).start()
+    threading.Thread(target=synth_worker, daemon=True).start()
     print("NEVAEH:", end=" ", flush=True)
     full = []
     STOP_TALKING.clear()
+    stalls = 0
     while True:
-        if _michael_talking():
-            break  # Michael started talking — drop the rest, listen
         try:
-            s = q.get(timeout=0.5)
+            item = play_q.get(timeout=5)
+            stalls = 0
         except Exception:
+            stalls += 1
+            if stalls >= 24:  # ~2 min with nothing — pipeline died
+                print("(voice pipeline stalled — showing text only)")
+                break
             continue
-        if s is None:
+        if item is None:
             break
-        full.append(s)
-        print(s, end=" ", flush=True)
-        speak(s)  # cleaned + voiced + face-synced, one sentence at a time
+        idx, sent, wav = item
+        full.append(sent)
+        print(sent, end=" ", flush=True)
+        if wav:
+            play_wav_file(wav, sent)
+        # synth failed -> text already printed, keep moving
     print()
     return " ".join(full)
 
@@ -2382,6 +2411,8 @@ def _mic_watcher():
 def _michael_talking():
     """True if Michael is speaking right now. One quick 250ms mic peek —
     never touches the mic while she is playing audio."""
+    if not VOICE_INPUT:
+        return False  # v77: no mic — nothing to barge in with
     mi = _mic_index()
     if mi is None:
         return False
@@ -2437,30 +2468,49 @@ def _play_with_barge_in(audio, sr):
     return False
 
 
-def speak(text, allow_barge=True):
-    """Speak text with Piper. Interruptible: if Michael starts talking she
-    stops mid-sentence and listens. Never crashes the brain: any voice
-    failure is printed plainly and the conversation continues in text."""
+def synth_sentence_wav(text, tag="r"):
+    """Run Piper on one sentence; return the wav path, or None on failure.
+    No playback — the parallel pipeline synthesizes the next sentence while
+    the current one plays, which is where v77's speedup comes from."""
     try:
         text = clean_for_speech(text)
+        if not text.strip():
+            return None
+        wav = os.path.join(HERE, f"nevaeh_s{tag}.wav")
         speed = SETTINGS.get("voice_speed", "0.85")
         r = subprocess.run([*PIPER_CMD, "--model", VOICE,
-                            "--output_file", REPLY_WAV,
+                            "--output_file", wav,
                             "--length-scale", str(speed)],
-                           input=text, capture_output=True, text=True, timeout=120)
+                           input=text, capture_output=True, text=True,
+                           timeout=120)
         if r.returncode != 0:
             err = (r.stderr or "").strip().splitlines()
             print(f"(voice glitch — piper said: {' '.join(err[-2:])[:200]})")
-            return
-        # Feed her face the loudness envelope so her glow follows her voice.
-        frames = speech_frames(REPLY_WAV)
+            return None
+        return wav
+    except Exception as e:
+        print(f"(voice glitch: {e})")
+        return None
+
+
+def play_wav_file(wav, text=""):
+    """Play a wav made by synth_sentence_wav. Feeds her face the loudness
+    envelope so her glow follows her voice. Never crashes the brain."""
+    try:
+        frames = speech_frames(wav)
         if not frames:
             secs = max(1.0, len(text) * 0.07)
             n = int(secs / 0.06)
             frames = [0.75 if i % 2 == 0 else 0.15 for i in range(n)]
         FACE_STATE["frames"] = frames
+        try:
+            import winsound  # proven on this machine — primary player
+            winsound.PlaySound(wav, winsound.SND_FILENAME)
+            return
+        except Exception as we:
+            print(f"(Windows player failed: {we} — trying sounddevice)")
         import wave
-        with wave.open(REPLY_WAV, "rb") as w:
+        with wave.open(wav, "rb") as w:
             sr = w.getframerate()
             sw = w.getsampwidth()
             nch = w.getnchannels()
@@ -2481,19 +2531,23 @@ def speak(text, allow_barge=True):
         if nch == 2:
             audio = audio.reshape(-1, 2).mean(axis=1).astype(np.float32)
         try:
-            import winsound  # proven on this machine — primary player
-            winsound.PlaySound(REPLY_WAV, winsound.SND_FILENAME)
-        except Exception as we:
-            print(f"(Windows player failed: {we} — trying sounddevice)")
-            try:
-                sd.play(audio, samplerate=sr)
-                sd.wait()
-            except Exception as pe:
-                print(f"(voice glitch: {pe})")
+            sd.play(audio, samplerate=sr)
+            sd.wait()
+        except Exception as pe:
+            print(f"(voice glitch: {pe})")
     except Exception as e:
         print(f"(voice glitch: {e})")
     finally:
         FACE_STATE["frames"] = []
+
+
+def speak(text, allow_barge=True):
+    """Speak text with Piper. Serial path, used for short fixed lines:
+    synthesize, then play. The conversation path uses think_and_speak's
+    parallel pipeline instead. (Barge-in needs a live mic — off in v77.)"""
+    wav = synth_sentence_wav(text, tag="r")
+    if wav:
+        play_wav_file(wav, text)
 
 
 def find_camera():
@@ -3528,11 +3582,15 @@ def self_diagnose():
     return " ".join(report)
 
 
-init_mic()  # needs speak() defined above; picks the mic that hears him
-if not _MIC_LIVE:
-    _CALM = True
-    print("(calm mode on — the screen will stay still. Just type to me.)")
-print("Nevaeh brain v76 online — rebuilt. Say 'goodbye' to stop.")
+if VOICE_INPUT:
+    init_mic()  # needs speak() defined above; picks the mic that hears him
+    if not _MIC_LIVE:
+        _CALM = True
+        print("(calm mode on — the screen will stay still. Just type to me.)")
+else:
+    _MIC_LIVE = False  # no mic in v77 — typed input only, loop never listens
+    print("(v77: voice input is OFF — type to me, I'll talk back out loud)")
+print("Nevaeh brain v77 online — faster. Say 'goodbye' to stop.")
 try:
     _cl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "nevaeh_crash.log")
@@ -3550,7 +3608,7 @@ threading.Thread(target=start_phone_remote, daemon=True).start()
 print("Ask 'what do you see?' to use the webcam.")
 print("Say 'go to sleep' anytime and I'll wait quietly for 'Nevaeh'.")
 print("I'll also greet you myself whenever you walk up to the camera.")
-paused = SETTINGS.get("wake_word", "off").lower() == "on"
+paused = VOICE_INPUT and SETTINGS.get("wake_word", "off").lower() == "on"
 if paused:
     speak("Hey Michael, I'll hang back quietly till you say my name.")
     print("(paused — say 'Nevaeh' to give a command)")
@@ -3651,16 +3709,11 @@ try:
                 _dead_rounds = globals().get("_dead_rounds", 0) + 1
                 globals()["_dead_rounds"] = _dead_rounds
                 if not _MIC_LIVE:
-                    # mic never heard him — stay in typed mode, nag rarely
-                    _last_nag = globals().get("_last_typed_nag", 0)
-                    if time.time() - _last_nag > 120 and not _CALM:
-                        globals()["_last_typed_nag"] = time.time()
-                        print("(my mic isn't hearing you — type to me in "
-                              "the type box, I read everything)")
+                    # v77: voice input is off — typed mode, no mic nags
                     globals()["_quiet_rounds"] = 0
                     globals()["_dead_rounds"] = 0
                     continue
-                if _dead_rounds >= 6:
+                if VOICE_INPUT and _dead_rounds >= 6:
                     globals()["_dead_rounds"] = 0
                     globals()["_quiet_rounds"] = 0
                     print("(I've had trouble hearing — re-checking the mic)")
@@ -3711,38 +3764,15 @@ try:
         else:
             t = heard.lower()
             if any(p in t for p in ["enroll my voice", "learn my voice",
-                                    "remember my voice"]):
-                reply = enroll_my_voice()
-            elif any(p in t for p in ["lock my voice", "voice lock on"]):
-                if VOICE_ID_AVAILABLE and NVOICE.has_voiceprint():
-                    save_setting("voice_lock", "on")
-                    reply = ("Voice lock is on — I'll only take orders "
-                             "from you now.")
-                else:
-                    reply = ("I don't know your voice yet — say "
-                             "'enroll my voice' first.")
-            elif any(p in t for p in ["unlock my voice", "voice lock off"]):
-                save_setting("voice_lock", "off")
-                reply = "Voice lock is off — I'll answer anyone again."
-            elif "voice filter off" in t:
-                save_setting("whisper_vad", "off")
-                reply = ("Voice filter off — I'll transcribe everything I "
-                         "hear, background noise included.")
-            elif "voice filter on" in t:
-                save_setting("whisper_vad", "on")
-                reply = "Voice filter back on."
-            elif "sharper ears" in t:
-                save_setting("whisper_model", "small")
-                reply = ("Sharpest hearing coming up — I'll catch every word, "
-                         "but I'll take longer to answer. Restart me.")
-            elif "balanced ears" in t:
-                save_setting("whisper_model", "base")
-                reply = ("Balanced ears — good hearing, faster answers. "
-                         "Restart me.")
-            elif "faster ears" in t:
-                save_setting("whisper_model", "tiny")
-                reply = ("Fastest answers coming up — but I might mishear "
-                         "more. Restart me.")
+                                    "remember my voice", "lock my voice",
+                                    "voice lock on", "unlock my voice",
+                                    "voice lock off", "voice filter off",
+                                    "voice filter on", "sharper ears",
+                                    "balanced ears", "faster ears"]):
+                # v77: mic input removed — these all tuned the microphone.
+                reply = ("Those tuned my microphone, which is off now — "
+                         "I'm already running my fastest brain, and I "
+                         "take orders from your typing.")
             elif any(p in t for p in ["self check", "diagnose yourself",
                                              "check yourself", "diagnose me",
                                              "run diagnostics"]):
@@ -3756,13 +3786,14 @@ try:
             elif any(p in t for p in ["normal mode", "lively mode",
                                       "wake up"]):
                 globals()["_CALM"] = False
-                reply = "Back to normal — I'm all ears."
+                reply = "Back to normal."
             elif any(p in t for p in ["check my sound", "sound check",
                                       "audio test", "test my mic",
                                       "test the mic", "mic test",
                                       "check the mic"]):
-                print("(running sound check...)")
-                reply = audio_doctor()
+                reply = ("Voice input is off in this version — I hear you "
+                         "through typing, and I talk back out loud. "
+                         "Nothing to test.")
             elif any(p in t for p in ["check for updates", "check for upgrade",
                                              "update yourself", "any updates"]):
                 ver = stage_brain_update()
